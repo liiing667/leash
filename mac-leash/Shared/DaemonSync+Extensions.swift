@@ -74,10 +74,37 @@ extension DaemonSync {
                 "file_rules": fileRules,
                 "exec_rules": execRules,
                 "network_rules": networkRules,
-                "version": ruleSet.version
+                "version": ruleSet.version,
+                "session_id": ruleSet.sessionID,
+                "generation": ruleSet.generation
             ]
 
             self.sendEnvelope(type: "mac.rule.sync", payload: payload, requestID: nil)
+        }
+    }
+
+    /// Publishes the current rule set as a recoverable transaction. The
+    /// generation advances strictly within the active session, so replayed or
+    /// out-of-order snapshots are rejected by the daemon instead of rolling
+    /// rule state backwards.
+    func publishRuleTransaction(version: String,
+                                fileRules: [RuleSet.FileRule],
+                                execRules: [RuleSet.ExecRule],
+                                networkRules: [RuleSet.NetworkRule]) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.ensureConnection()
+
+            self.ruleGeneration += 1
+            let ruleSet = RuleSet(
+                fileRules: fileRules,
+                execRules: execRules,
+                networkRules: networkRules,
+                version: version,
+                sessionID: self.sessionID,
+                generation: self.ruleGeneration
+            )
+            self.sendRuleSnapshot(ruleSet: ruleSet)
         }
     }
 
@@ -403,6 +430,11 @@ extension DaemonSync {
         os_log("Attempting websocket connection to %{public}@...", log: log, type: .info, endpointURL.absoluteString)
         connectAttempts += 1
         shimID = UUID().uuidString
+        // Every physical (re)connection is a fresh sync transaction boundary:
+        // generation numbering restarts so a snapshot from the dead
+        // connection can never be applied to the new session.
+        ruleGeneration = 0
+        acknowledgedRuleGeneration = 0
 
         let url = endpointURL
         let task = session.webSocketTask(with: url)
@@ -461,12 +493,45 @@ extension DaemonSync {
         let helloPayload: [String: Any] = [
             "platform": "darwin",
             "capabilities": capabilities,
-            "version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+            "version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev",
+            "client_id": clientID,
+            "session_id": sessionID
         ]
         sendEnvelope(type: "client.hello", payload: helloPayload, requestID: nil)
         isConnected = true
         connectAttempts = 0
         os_log("Websocket hello sent (capabilities=%{public}@)", log: log, type: .info, capabilities.joined(separator: ","))
+    }
+
+    /// Handles a daemon verdict for a transactional rule sync. A rejected
+    /// snapshot means the daemon kept its authoritative state; realign our
+    /// counters so the next update is committed instead of replaying a stale
+    /// generation.
+    func handleRuleSyncAck(_ payload: [String: Any]) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let accepted = (payload["accepted"] as? Bool) ?? false
+            let serverGeneration = (payload["server_generation"] as? NSNumber)?.uint64Value
+                ?? (payload["server_generation"] as? UInt64) ?? 0
+
+            if accepted {
+                self.acknowledgedRuleGeneration = max(self.acknowledgedRuleGeneration, self.ruleGeneration)
+                os_log("Rule sync transaction accepted generation=%{public}d",
+                       log: self.log, type: .info, self.ruleGeneration)
+                return
+            }
+
+            os_log("Rule sync transaction rejected reason=%{public}@ server_generation=%{public}d; realigning",
+                   log: self.log, type: .error,
+                   (payload["reason"] as? String) ?? "unknown", serverGeneration)
+            // Drop any uncommitted local progress and adopt the daemon's
+            // boundary. The next publish starts a fresh, valid transaction.
+            if serverGeneration > self.ruleGeneration {
+                self.ruleGeneration = serverGeneration
+            } else {
+                self.ruleGeneration = self.acknowledgedRuleGeneration
+            }
+        }
     }
 
     func scheduleReconnect() {
@@ -562,6 +627,12 @@ extension DaemonSync {
             // Check if this is a response to a pending request
             if let requestID = envelope.requestID, let handler = pendingRequests.removeValue(forKey: requestID) {
                 handler(.success(payload))
+                return
+            }
+
+            // Transactional rule sync verdicts realign local generation state.
+            if envelope.type == "mac.rule.sync.ack" {
+                self.handleRuleSyncAck(payload)
                 return
             }
 

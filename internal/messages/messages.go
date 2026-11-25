@@ -14,6 +14,7 @@ const (
 	TypeClientHello          = "client.hello"
 	TypeMacPIDSync           = "mac.pid.sync"
 	TypeMacRuleSync          = "mac.rule.sync"
+	TypeMacRuleSyncAck       = "mac.rule.sync.ack"
 	TypeMacEvent             = "mac.event"
 	TypeMacAck               = "mac.ack"
 	TypeShimHello            = "shim.hello"
@@ -138,6 +139,15 @@ type ClientHelloPayload struct {
 	Platform     string   `json:"platform"`
 	Capabilities []string `json:"capabilities,omitempty"`
 	Version      string   `json:"version,omitempty"`
+	// ClientID is the stable identifier of the macOS client process. It stays
+	// constant across websocket reconnects, unlike the connection-scoped
+	// websocket client id assigned by the hub.
+	ClientID string `json:"client_id,omitempty"`
+	// SessionID identifies the client's logical sync session. Together with
+	// the connection-scoped websocket id it lets the daemon bind snapshots to
+	// a specific client connection and fence off state produced by a dead
+	// connection after a reconnect.
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // MacTrackedPID describes a leash-tracked process on macOS.
@@ -196,6 +206,27 @@ type MacRuleSyncPayload struct {
 	ExecRules    []MacExecRule    `json:"exec_rules,omitempty"`
 	NetworkRules []MacNetworkRule `json:"network_rules,omitempty"`
 	Version      string           `json:"version,omitempty"`
+	// SessionID binds the snapshot to the client's logical sync session.
+	// Snapshots carrying a session that no longer owns the connection are
+	// rejected as stale transactions.
+	SessionID string `json:"session_id,omitempty"`
+	// Generation is a monotonically increasing per-session counter. The
+	// daemon only accepts a generation strictly greater than the one it has
+	// already committed for the owning client/session, so out-of-order or
+	// replayed snapshots cannot roll state backwards.
+	Generation uint64 `json:"generation,omitempty"`
+}
+
+// RuleSyncAckPayload reports the outcome of a transactional rule sync.
+type RuleSyncAckPayload struct {
+	Accepted   bool   `json:"accepted"`
+	Reason     string `json:"reason,omitempty"`
+	ClientID   string `json:"client_id,omitempty"`
+	SessionID  string `json:"session_id,omitempty"`
+	Generation uint64 `json:"generation,omitempty"`
+	// ServerGeneration is the generation currently committed on the daemon.
+	// A client whose transaction was rejected can realign to it.
+	ServerGeneration uint64 `json:"server_generation,omitempty"`
 }
 
 // MacMITMConfigPayload distributes MITM proxy configuration to macOS shims.

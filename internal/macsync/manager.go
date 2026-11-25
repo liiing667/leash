@@ -15,11 +15,21 @@ import (
 
 // ClientState tracks connected macOS clients and their advertised capabilities.
 type ClientState struct {
-	ID           string
+	ID string
+	// ConnectionID is the connection-scoped websocket client id assigned by
+	// the hub. It changes on every websocket reconnect, unlike ID which is the
+	// stable identifier advertised by the macOS client itself.
+	ConnectionID string
+	// SessionID identifies the client's current logical sync session.
+	SessionID    string
 	Platform     string
 	Capabilities map[string]bool
 	Version      string
 	LastSeen     time.Time
+	Connected    bool
+	// RuleGeneration is the highest rule-snapshot generation committed for
+	// the client's current session.
+	RuleGeneration uint64
 }
 
 // RuleSnapshot represents the latest macOS rule set delivered over the websocket.
@@ -29,13 +39,39 @@ type RuleSnapshot struct {
 	NetworkRules []messages.MacNetworkRule
 	Version      string
 	LastUpdate   time.Time
+	// ClientID, SessionID and Generation bind the public snapshot to the
+	// exact client connection transaction that produced it. A snapshot whose
+	// session no longer owns the connection must never be applied to a new
+	// session.
+	ClientID   string
+	SessionID  string
+	Generation uint64
+}
+
+// StaleRuleSyncError indicates that a rule-sync transaction could not be
+// committed because it was produced by a session that no longer owns the
+// client connection or carried an out-of-date generation.
+type StaleRuleSyncError struct {
+	Reason     string
+	ClientID   string
+	SessionID  string
+	Generation uint64
+	// ServerGeneration is the generation currently committed on the daemon.
+	ServerGeneration uint64
+}
+
+func (e *StaleRuleSyncError) Error() string {
+	return fmt.Sprintf("macsync: stale rule sync rejected: %s (client=%s session=%s generation=%d server_generation=%d)",
+		e.Reason, e.ClientID, e.SessionID, e.Generation, e.ServerGeneration)
 }
 
 // Manager centralises macOS-specific synchronisation data received over the websocket.
 type Manager struct {
-	mu           sync.RWMutex
-	logger       *lsm.SharedLogger
-	clients      map[string]*ClientState
+	mu      sync.RWMutex
+	logger  *lsm.SharedLogger
+	clients map[string]*ClientState
+	// stableIndex maps a stable client id to its connection-scoped websocket id.
+	stableIndex  map[string]string
 	trackedPIDs  map[int]messages.MacTrackedPID
 	rules        RuleSnapshot
 	policyRules  map[string]messages.MacPolicyRule         // keyed by rule ID
@@ -44,43 +80,120 @@ type Manager struct {
 	mitmConfig   *messages.MacMITMConfigPayload
 	mitmSessions map[string]messages.MacMITMSessionPayload
 	mitmVersion  int
+	// sessionByClient records the logical session that currently owns each
+	// stable client, so transactions from a dead session can be fenced off.
+	sessionByClient map[string]string
 }
 
 // NewManager returns a macOS sync manager backed by the provided logger.
 func NewManager(logger *lsm.SharedLogger) *Manager {
 	return &Manager{
-		logger:       logger,
-		clients:      make(map[string]*ClientState),
-		trackedPIDs:  make(map[int]messages.MacTrackedPID),
-		policyRules:  make(map[string]messages.MacPolicyRule),
-		networkRules: make(map[string]messages.MacNetworkRule),
-		policyEvents: make(map[string]messages.MacPolicyEventPayload),
-		mitmSessions: make(map[string]messages.MacMITMSessionPayload),
+		logger:          logger,
+		clients:         make(map[string]*ClientState),
+		stableIndex:     make(map[string]string),
+		trackedPIDs:     make(map[int]messages.MacTrackedPID),
+		policyRules:     make(map[string]messages.MacPolicyRule),
+		networkRules:    make(map[string]messages.MacNetworkRule),
+		policyEvents:    make(map[string]messages.MacPolicyEventPayload),
+		mitmSessions:    make(map[string]messages.MacMITMSessionPayload),
+		sessionByClient: make(map[string]string),
 	}
 }
 
-// RegisterClient records a new client hello payload.
-func (m *Manager) RegisterClient(clientID string, payload *messages.ClientHelloPayload) {
+// RegisterClient records a new client hello payload. connectionID is the
+// connection-scoped websocket id; the hello payload may additionally carry a
+// stable client id and logical session id. When the same client reconnects in
+// a new session, rule state owned by the previous session is invalidated so it
+// can never be restored into the new session.
+func (m *Manager) RegisterClient(connectionID string, payload *messages.ClientHelloPayload) {
 	if payload == nil {
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	stableID := strings.TrimSpace(payload.ClientID)
+	if stableID == "" {
+		// Older clients don't advertise a stable id; fall back to the
+		// connection-scoped id so binding semantics still apply.
+		stableID = connectionID
+	}
+	sessionID := strings.TrimSpace(payload.SessionID)
+
+	// Evict any state still attached to a previous connection of this client.
+	if priorConn, ok := m.stableIndex[stableID]; ok && priorConn != connectionID {
+		if _, exists := m.clients[priorConn]; exists {
+			log.Printf("macsync: replacing stale connection %s for client %s with %s", priorConn, stableID, connectionID)
+			delete(m.clients, priorConn)
+		}
+	}
+
+	priorSession := m.sessionByClient[stableID]
+	sessionRotated := sessionID != "" && priorSession != "" && priorSession != sessionID
+	priorConn, known := m.stableIndex[stableID]
+	reconnected := known && priorConn != connectionID
+	// A reconnect (whether the logical session rotated or not) must never
+	// start from the previous connection's rule state. Fence off any public
+	// snapshot still owned by this client before the new session commits its
+	// first transaction.
+	if (reconnected || sessionRotated) && m.rules.ClientID == stableID {
+		log.Printf("macsync: invalidating rule snapshot on reconnect of client %s (old_session=%s new_session=%s)",
+			stableID, priorSession, sessionID)
+		m.rules = RuleSnapshot{}
+	}
+
 	caps := make(map[string]bool, len(payload.Capabilities))
 	for _, cap := range payload.Capabilities {
 		caps[strings.ToLower(strings.TrimSpace(cap))] = true
 	}
 
-	m.clients[clientID] = &ClientState{
-		ID:           clientID,
+	m.clients[connectionID] = &ClientState{
+		ID:           stableID,
+		ConnectionID: connectionID,
+		SessionID:    sessionID,
 		Platform:     strings.ToLower(strings.TrimSpace(payload.Platform)),
 		Capabilities: caps,
 		Version:      payload.Version,
 		LastSeen:     time.Now(),
+		Connected:    true,
+		// Generation restarts at zero for a freshly registered session; the
+		// first committed snapshot must use generation >= 1.
+		RuleGeneration: 0,
+	}
+	m.stableIndex[stableID] = connectionID
+	if sessionID != "" {
+		m.sessionByClient[stableID] = sessionID
 	}
 
-	log.Printf("macsync: registered client %s platform=%s caps=%v", clientID, payload.Platform, payload.Capabilities)
+	log.Printf("macsync: registered client %s connection=%s session=%s platform=%s caps=%v",
+		stableID, connectionID, sessionID, payload.Platform, payload.Capabilities)
+}
+
+// UnregisterClient marks a websocket connection as disconnected and removes
+// its client state. Rule snapshots owned by the disconnected session are
+// invalidated so they cannot be applied to a future session after reconnect.
+func (m *Manager) UnregisterClient(connectionID string) {
+	if connectionID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	client, ok := m.clients[connectionID]
+	if !ok {
+		return
+	}
+	delete(m.clients, connectionID)
+	if m.stableIndex[client.ID] == connectionID {
+		delete(m.stableIndex, client.ID)
+	}
+
+	if m.rules.ClientID == client.ID && m.rules.SessionID == client.SessionID {
+		log.Printf("macsync: invalidating rule snapshot on disconnect of client %s session %s", client.ID, client.SessionID)
+		m.rules = RuleSnapshot{}
+	}
+
+	log.Printf("macsync: unregistered client %s connection=%s session=%s", client.ID, connectionID, client.SessionID)
 }
 
 // GetAllClients returns a snapshot of all connected clients.
@@ -124,13 +237,69 @@ func (m *Manager) UpdateTrackedPIDs(clientID string, payload *messages.MacPIDSyn
 }
 
 // UpdateRules stores the last rule set received from a macOS client.
-func (m *Manager) UpdateRules(clientID string, payload *messages.MacRuleSyncPayload) RuleSnapshot {
+// The update is applied as a safe transaction: it must originate from the
+// connection that currently owns the client, must target the client's current
+// session, and must carry a generation strictly newer than the committed one.
+// Rejected transactions leave all existing state untouched.
+func (m *Manager) UpdateRules(connectionID string, payload *messages.MacRuleSyncPayload) (RuleSnapshot, error) {
 	if payload == nil {
-		return m.CurrentRules()
+		return m.CurrentRules(), nil
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	client, ok := m.clients[connectionID]
+	if !ok || !client.Connected {
+		err := &StaleRuleSyncError{
+			Reason:           "client connection is not registered",
+			ClientID:         "",
+			SessionID:        payload.SessionID,
+			Generation:       payload.Generation,
+			ServerGeneration: m.rules.Generation,
+		}
+		log.Printf("macsync: %v", err)
+		return m.rules, err
+	}
+
+	// Bind the payload to the session that owns the live connection. Payloads
+	// without an explicit session are accepted for legacy clients and treated
+	// as belonging to the registered session.
+	payloadSession := strings.TrimSpace(payload.SessionID)
+	effectiveSession := client.SessionID
+	if payloadSession != "" {
+		if client.SessionID != "" && payloadSession != client.SessionID {
+			err := &StaleRuleSyncError{
+				Reason:           "payload session does not own the connection",
+				ClientID:         client.ID,
+				SessionID:        payloadSession,
+				Generation:       payload.Generation,
+				ServerGeneration: client.RuleGeneration,
+			}
+			log.Printf("macsync: %v", err)
+			return m.rules, err
+		}
+		effectiveSession = payloadSession
+	}
+
+	generation := payload.Generation
+	if generation == 0 {
+		// Legacy clients don't track generations yet. Assign the next
+		// server-side generation so their updates remain ordered and cannot
+		// roll state backwards, while new clients enforce their own
+		// monotonic counter transactionally.
+		generation = client.RuleGeneration + 1
+	} else if generation <= client.RuleGeneration {
+		err := &StaleRuleSyncError{
+			Reason:           "generation is not newer than committed generation",
+			ClientID:         client.ID,
+			SessionID:        effectiveSession,
+			Generation:       generation,
+			ServerGeneration: client.RuleGeneration,
+		}
+		log.Printf("macsync: %v", err)
+		return m.rules, err
+	}
 
 	m.rules = RuleSnapshot{
 		FileRules:    payload.FileRules,
@@ -138,14 +307,16 @@ func (m *Manager) UpdateRules(clientID string, payload *messages.MacRuleSyncPayl
 		NetworkRules: payload.NetworkRules,
 		Version:      payload.Version,
 		LastUpdate:   time.Now(),
+		ClientID:     client.ID,
+		SessionID:    effectiveSession,
+		Generation:   generation,
 	}
+	client.RuleGeneration = generation
+	client.LastSeen = time.Now()
 
-	if client := m.clients[clientID]; client != nil {
-		client.LastSeen = time.Now()
-	}
-
-	log.Printf("macsync: rule update from %s file=%d exec=%d network=%d", clientID, len(payload.FileRules), len(payload.ExecRules), len(payload.NetworkRules))
-	return m.rules
+	log.Printf("macsync: committed rule transaction client=%s session=%s generation=%d file=%d exec=%d network=%d",
+		client.ID, effectiveSession, generation, len(payload.FileRules), len(payload.ExecRules), len(payload.NetworkRules))
+	return m.rules, nil
 }
 
 // CurrentTrackedPIDs returns the tracked PID snapshot.
@@ -164,6 +335,54 @@ func (m *Manager) CurrentRules() RuleSnapshot {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.rules
+}
+
+// ClientSessionInfo describes the binding of a live client connection.
+type ClientSessionInfo struct {
+	StableID       string
+	ConnectionID   string
+	SessionID      string
+	RuleGeneration uint64
+	Connected      bool
+}
+
+// LookupClient returns the session binding for a connection-scoped client id.
+func (m *Manager) LookupClient(connectionID string) (ClientSessionInfo, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	client, ok := m.clients[connectionID]
+	if !ok {
+		return ClientSessionInfo{}, false
+	}
+	return ClientSessionInfo{
+		StableID:       client.ID,
+		ConnectionID:   client.ConnectionID,
+		SessionID:      client.SessionID,
+		RuleGeneration: client.RuleGeneration,
+		Connected:      client.Connected,
+	}, true
+}
+
+// PublicRuleSnapshot returns the committed rule snapshot together with its
+// client/session/generation binding. The bool is false when no snapshot is
+// committed or the snapshot belongs to a session that is no longer live, in
+// which case callers must not advertise stale rule state to clients.
+func (m *Manager) PublicRuleSnapshot() (RuleSnapshot, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.rules.Generation == 0 && m.rules.LastUpdate.IsZero() {
+		return RuleSnapshot{}, false
+	}
+	connID, ok := m.stableIndex[m.rules.ClientID]
+	if !ok {
+		return RuleSnapshot{}, false
+	}
+	client, ok := m.clients[connID]
+	if !ok || !client.Connected || client.SessionID != m.rules.SessionID {
+		return RuleSnapshot{}, false
+	}
+	return m.rules, true
 }
 
 // LogMacEvent converts mac-specific telemetry into the shared logger stream.

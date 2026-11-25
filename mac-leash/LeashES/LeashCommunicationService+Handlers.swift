@@ -148,6 +148,18 @@ extension LeashCommunicationService {
         queue.async { [weak self] in
             guard let self else { return }
 
+            // Only apply snapshots bound to our current sync session. A
+            // snapshot without a binding (or bound to a rotated session) is
+            // stale state from a dead connection and must not replace the
+            // cache after a reconnect.
+            if let snapshotSession = payload["session_id"] as? String, !snapshotSession.isEmpty {
+                guard snapshotSession == self.daemon.sessionID else {
+                    os_log("Ignoring rule snapshot from foreign session %{public}@",
+                           log: self.log, type: .error, snapshotSession)
+                    return
+                }
+            }
+
             guard let rulesData = payload["rules"] as? [[String: Any]] else {
                 os_log("Invalid rule snapshot payload", log: self.log, type: .error)
                 return

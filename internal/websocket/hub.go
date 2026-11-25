@@ -261,6 +261,7 @@ type WebSocketHub struct {
 	unregister  chan *client
 	unicast     chan clientSend
 	incoming    chan ClientMessage
+	disconnects chan string
 	mutex       sync.RWMutex
 	logger      *lsm.SharedLogger
 	eventBuffer *EventRingBuffer
@@ -325,6 +326,7 @@ func NewWebSocketHub(logger *lsm.SharedLogger, bufferSize int, bulkMaxEvents int
 		unregister:    make(chan *client),
 		unicast:       make(chan clientSend, 128),
 		incoming:      make(chan ClientMessage, 256),
+		disconnects:   make(chan string, 256),
 		logger:        logger,
 		eventBuffer:   NewEventRingBuffer(bufferSize),
 		instanceID:    uuid.NewString(),
@@ -426,8 +428,23 @@ func (h *WebSocketHub) removeClient(id string) {
 
 	if ok && client != nil {
 		client.close()
+		// Notify consumers that the websocket session for this client is gone.
+		// State keyed by the connection-scoped client id must not survive the
+		// connection, otherwise a stale client could re-publish it into a new
+		// session after a reconnect.
+		select {
+		case h.disconnects <- id:
+		default:
+			log.Printf("websocket: disconnect notification dropped for client %s (channel full)", id)
+		}
 	}
 	log.Printf("WebSocket client disconnected. Total clients: %d", len(h.clients))
+}
+
+// Disconnects returns a channel that emits the connection-scoped client id
+// whenever a websocket client is fully unregistered from the hub.
+func (h *WebSocketHub) Disconnects() <-chan string {
+	return h.disconnects
 }
 
 // getHistoricalEvents returns all buffered events formatted as NDJSON
@@ -737,7 +754,9 @@ func (c *client) close() {
 	default:
 		close(c.closed)
 		close(c.send)
-		_ = c.conn.Close()
+		if c.conn != nil {
+			_ = c.conn.Close()
+		}
 	}
 	c.closeMu.Unlock()
 }

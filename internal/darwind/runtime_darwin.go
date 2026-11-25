@@ -736,6 +736,13 @@ func (rt *runtimeState) startClientMessageLoop() {
 			rt.handleClientMessage(msg.ClientID, msg.Payload)
 		}
 	}()
+	go func() {
+		for clientID := range rt.wsHub.Disconnects() {
+			if rt.macSync != nil {
+				rt.macSync.UnregisterClient(clientID)
+			}
+		}
+	}()
 }
 
 func (rt *runtimeState) handleClientMessage(clientID string, payload []byte) {
@@ -799,14 +806,30 @@ func (rt *runtimeState) dispatchClientEnvelope(clientID string, env *messages.En
 			return
 		}
 		if rt.macSync != nil {
-			snapshot := rt.macSync.UpdateRules(clientID, &rulesPayload)
+			snapshot, err := rt.macSync.UpdateRules(clientID, &rulesPayload)
+			if err != nil {
+				logPolicyEvent("mac.rule.sync.rejected", map[string]any{
+					"client":     clientID,
+					"session_id": rulesPayload.SessionID,
+					"generation": rulesPayload.Generation,
+					"reason":     err.Error(),
+				})
+				rt.sendRuleSyncAck(clientID, env, false, err)
+				return
+			}
 			logPolicyEvent("mac.rule.sync", map[string]any{
 				"client":        clientID,
+				"session_id":    snapshot.SessionID,
+				"generation":    snapshot.Generation,
 				"file_rules":    len(snapshot.FileRules),
 				"exec_rules":    len(snapshot.ExecRules),
 				"network_rules": len(snapshot.NetworkRules),
 				"version":       snapshot.Version,
 			})
+			// The dedicated transaction ack is the authoritative verdict;
+			// do not also send a generic mac.ack for the same transaction.
+			rt.sendRuleSyncAck(clientID, env, true, nil)
+			return
 		}
 		rt.sendAck(clientID, env, "ok", "rules updated")
 
@@ -982,6 +1005,43 @@ func (rt *runtimeState) dispatchClientEnvelope(clientID string, env *messages.En
 	}
 }
 
+// sendRuleSyncAck reports whether a rule-sync transaction was committed and,
+// on rejection, echoes the server's authoritative generation so the client
+// can realign without replaying stale state.
+func (rt *runtimeState) sendRuleSyncAck(clientID string, env *messages.Envelope, accepted bool, syncErr error) {
+	if rt.wsHub == nil || clientID == "" {
+		return
+	}
+
+	ack := messages.RuleSyncAckPayload{Accepted: accepted}
+	if syncErr != nil {
+		var stale *macsync.StaleRuleSyncError
+		if errors.As(syncErr, &stale) {
+			ack.Reason = stale.Reason
+			ack.ClientID = stale.ClientID
+			ack.SessionID = stale.SessionID
+			ack.Generation = stale.Generation
+			ack.ServerGeneration = stale.ServerGeneration
+		} else {
+			ack.Reason = syncErr.Error()
+		}
+	}
+
+	ackEnv, err := messages.WrapPayload(env.SessionID, env.ShimID, messages.TypeMacRuleSyncAck, env.Version, ack)
+	if err != nil {
+		log.Printf("macsync: failed to craft rule sync ack: %v", err)
+		return
+	}
+	data, err := json.Marshal(ackEnv)
+	if err != nil {
+		log.Printf("macsync: failed to marshal rule sync ack: %v", err)
+		return
+	}
+	if err := rt.wsHub.SendToClient(clientID, data); err != nil {
+		log.Printf("macsync: failed to send rule sync ack to %s: %v", clientID, err)
+	}
+}
+
 func (rt *runtimeState) sendAck(clientID string, env *messages.Envelope, status, message string) {
 	if rt.wsHub == nil || clientID == "" {
 		return
@@ -1071,6 +1131,11 @@ func (rt *runtimeState) broadcastRuleUpdate() {
 
 	rules := rt.macSync.GetPolicyRules()
 	payload := map[string]any{"rules": rules}
+	if snap, ok := rt.macSync.PublicRuleSnapshot(); ok {
+		payload["client_id"] = snap.ClientID
+		payload["session_id"] = snap.SessionID
+		payload["generation"] = snap.Generation
+	}
 
 	env, err := messages.WrapPayload("", "", "mac.rule.snapshot", 1, payload)
 	if err != nil {
@@ -1321,6 +1386,11 @@ func (rt *runtimeState) pushMacStateToClient(clientID string) {
 
 	rules := rt.macSync.GetPolicyRules()
 	rulePayload := map[string]any{"rules": rules}
+	if info, ok := rt.macSync.LookupClient(clientID); ok {
+		rulePayload["client_id"] = info.StableID
+		rulePayload["session_id"] = info.SessionID
+		rulePayload["generation"] = info.RuleGeneration
+	}
 	if env, err := messages.WrapPayload("", "", "mac.rule.snapshot", 1, rulePayload); err == nil {
 		if data, err := json.Marshal(env); err == nil {
 			if err := rt.wsHub.SendToClient(clientID, data); err != nil {

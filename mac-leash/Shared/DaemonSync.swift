@@ -18,8 +18,26 @@ final class DaemonSync: NSObject {
     var isConnected = false
     var reconnectWorkItem: DispatchWorkItem?
 
+    /// Stable identifier of this client process. It survives websocket
+    /// reconnects so the daemon can recognise the same client across
+    /// different connection-scoped ids.
+    let clientID = UUID().uuidString
+    /// Logical sync session shared with the daemon's message envelopes. It
+    /// identifies this sync pipeline; the per-connection boundary is carried
+    /// by `shimID` (rotated on every reconnect) and the connection-scoped id
+    /// the daemon assigns to each websocket.
     let sessionID = UUID().uuidString
     var shimID = UUID().uuidString
+
+    /// Monotonic per-connection rule transaction counter. It restarts at zero
+    /// on every (re)connect so the first snapshot over a new connection is
+    /// generation 1 and can never be confused with state the dead connection
+    /// published. Combined with the connection-scoped daemon id this prevents
+    /// old client rules from being applied to the new connection.
+    var ruleGeneration: UInt64 = 0
+    /// Highest generation acknowledged as committed by the daemon. Used to
+    /// realign after a rejected (stale) transaction.
+    var acknowledgedRuleGeneration: UInt64 = 0
 
     var capabilities: [String] = ["pid-sync", "rule-sync", "event", "policy", "network-rules"]
     var connectAttempts = 0
@@ -166,12 +184,18 @@ final class DaemonSync: NSObject {
         let execRules: [ExecRule]
         let networkRules: [NetworkRule]
         let version: String
+        /// Logical session this snapshot belongs to.
+        let sessionID: String
+        /// Monotonic generation within the current session.
+        let generation: UInt64
 
         enum CodingKeys: String, CodingKey {
             case fileRules = "file_rules"
             case execRules = "exec_rules"
             case networkRules = "network_rules"
             case version
+            case sessionID = "session_id"
+            case generation
         }
     }
 
