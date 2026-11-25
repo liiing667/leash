@@ -23,6 +23,7 @@ import (
 	autocomplete "github.com/strongdm/leash/internal/cedar/autocomplete"
 	"github.com/strongdm/leash/internal/lsm"
 	"github.com/strongdm/leash/internal/policy"
+	"github.com/strongdm/leash/internal/policygen"
 	"github.com/strongdm/leash/internal/proxy"
 	"github.com/strongdm/leash/internal/transpiler"
 	websockethub "github.com/strongdm/leash/internal/websocket"
@@ -44,6 +45,10 @@ type policyAPI struct {
 
 	// policyPath is the canonical Cedar file persisted for the file layer.
 	policyPath string
+
+	// genStore durably persists complete policy generations so public writes
+	// and cold-start recovery only ever observe a fully committed policy.
+	genStore *policygen.Store
 
 	// mode is a lightweight UI indicator for enforcement state. Values:
 	//   - "enforce": runtime overlay cleared; file layer active
@@ -99,25 +104,35 @@ func newPolicyAPI(mgr *policy.Manager, policyPath string, broadcaster policyBroa
 			api.wsHub = hub
 		}
 	}
-	// Attempt to restore runtime Cedar on startup
-	if b, err := loadCedarRuntime(); err == nil && len(b) > 0 {
-		if comp, compErr := cedarutil.CompileString("cedar-runtime.cedar", string(b)); compErr == nil {
-			if hasAnyRules(comp.Policies, comp.HTTPRules) {
-				if err := api.mgr.SetRuntimeRules(comp.Policies, comp.HTTPRules); err != nil {
-					if !softLSMError(err) {
-						logPolicyEvent("policy.restore", map[string]any{"source": "runtime", "error": err.Error()})
-					}
-				} else {
+
+	// Recover exactly one complete policy generation. The runtime bootstrap
+	// already loaded the canonical Cedar into the file layer, so the recovered
+	// generation is tracked as the operative document without layering a stale
+	// second copy into the runtime overlay.
+	store, storeErr := policygen.New(getLeashDirFromEnv(), policyPath)
+	if storeErr != nil {
+		logPolicyEvent("policy.restore", map[string]any{"source": "generation", "error": storeErr.Error()})
+	}
+	api.genStore = store
+
+	if store != nil {
+		if gen, err := store.Current(); err == nil && strings.TrimSpace(gen.Cedar) != "" {
+			if comp, compErr := cedarutil.CompileString("cedar-generation.cedar", gen.Cedar); compErr == nil {
+				if hasAnyRules(comp.Policies, comp.HTTPRules) {
 					api.mu.Lock()
-					api.cedarRuntime = string(b)
+					api.cedarRuntime = gen.Cedar
 					api.mu.Unlock()
-					logPolicyEvent("policy.restore", map[string]any{"source": "runtime"})
+					logPolicyEvent("policy.restore", map[string]any{
+						"source":     "generation",
+						"generation": gen.ID,
+					})
 				}
+			} else if detail, ok := compErr.(*cedarutil.ErrorDetail); ok {
+				logPolicyEvent("policy.restore", map[string]any{"source": "generation", "error": detail.Message})
 			}
-		} else if detail, ok := compErr.(*cedarutil.ErrorDetail); ok {
-			logPolicyEvent("policy.restore", map[string]any{"source": "runtime", "error": detail.Message})
 		}
 	}
+
 	// Determine whether a canonical Cedar file already exists with content. When present,
 	// prefer that as the operator-authored source instead of seeding a permissive runtime overlay.
 	canonicalHasCedar := false
@@ -138,7 +153,7 @@ func newPolicyAPI(mgr *policy.Manager, policyPath string, broadcaster policyBroa
 				api.mu.Lock()
 				api.cedarRuntime = policy.DefaultCedar()
 				api.mu.Unlock()
-				_ = saveCedarRuntime([]byte(api.cedarRuntime))
+				api.publishGeneration(api.cedarRuntime, "baseline")
 				logPolicyEvent("policy.restore", map[string]any{"source": "baseline"})
 			}
 		} else if detail, ok := err.(*cedarutil.ErrorDetail); ok {
@@ -216,23 +231,21 @@ func (api *policyAPI) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := api.mgr.SetRuntimeRules(compilation.Policies, compilation.HTTPRules); err != nil {
-		if softLSMError(err) {
-			logPolicyEvent("lsm.update.skip", map[string]any{"reason": err.Error()})
-		} else {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]any{"message": err.Error()}})
-			return
+	// Safe transaction: publish the complete generation durably first, then
+	// apply the runtime overlay with rollback on post-processing failure.
+	if _, err := api.commitPolicyTransaction(cedar, "post", true, func() error {
+		if err := api.mgr.SetRuntimeRules(compilation.Policies, compilation.HTTPRules); err != nil {
+			if softLSMError(err) {
+				logPolicyEvent("lsm.update.skip", map[string]any{"reason": err.Error()})
+				return nil
+			}
+			return err
 		}
+		return nil
+	}); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]any{"message": err.Error()}})
+		return
 	}
-
-	// Persist cedarRuntime atomically; log but do not fail API on error
-	if err := saveCedarRuntime([]byte(cedar)); err != nil {
-		logPolicyEvent("policy.update", map[string]any{"error": err.Error(), "persist": "cedar-runtime"})
-	}
-
-	api.mu.Lock()
-	api.cedarRuntime = cedar
-	api.mu.Unlock()
 
 	resp := api.buildPoliciesResponse()
 	api.respondPolicies(w, resp)
@@ -445,63 +458,43 @@ func (api *policyAPI) handlePatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !permitAllMode {
-		if err := api.mgr.SetRuntimeRules(compilation.Policies, compilation.HTTPRules); err != nil {
-			if softLSMError(err) {
+	// Safe transaction: publish one complete generation before touching any
+	// in-memory layer; roll back to the previous generation on failure.
+	if _, err := api.commitPolicyTransaction(updated, "patch", true, func() error {
+		if !permitAllMode {
+			if err := api.mgr.SetRuntimeRules(compilation.Policies, compilation.HTTPRules); err != nil && !softLSMError(err) {
+				return err
+			} else if err != nil {
 				logPolicyEvent("lsm.update.skip", map[string]any{"reason": err.Error()})
-			} else {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-				return
 			}
 		}
-	}
 
-	if err := saveCedarRuntime([]byte(updated)); err != nil {
-		logPolicyEvent("policy.patch", map[string]any{"error": err.Error(), "persist": "cedar-runtime"})
-	}
-
-	api.mu.Lock()
-	if permitAllMode {
-		api.cedarPrev = updated
-	}
-	api.cedarRuntime = updated
-	api.mu.Unlock()
-
-	prevFile, prevHTTP, _, _ := api.mgr.Snapshot()
-	if err := api.mgr.UpdateFileRules(compilation.Policies, compilation.HTTPRules); err != nil {
-		if softLSMError(err) {
+		if err := api.mgr.UpdateFileRules(compilation.Policies, compilation.HTTPRules); err != nil && !softLSMError(err) {
+			return err
+		} else if err != nil {
 			logPolicyEvent("lsm.update.skip", map[string]any{"reason": err.Error()})
-		} else {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-			return
 		}
-	}
 
-	persistPayload := updated
-	if persistPayload != "" && !strings.HasSuffix(persistPayload, "\n") {
-		persistPayload += "\n"
-	}
-	if err := api.saveCanonicalCedar([]byte(persistPayload)); err != nil {
-		_ = api.mgr.UpdateFileRules(prevFile, prevHTTP)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": fmt.Sprintf("failed to persist Cedar: %v", err)})
-		return
-	}
-
-	if applyMode == "enforce" {
-		_ = api.mgr.SetRuntimeOnly(false)
-		if err := api.mgr.SetRuntimeRules(&lsm.PolicySet{}, nil); err != nil {
-			if softLSMError(err) {
+		if applyMode == "enforce" {
+			_ = api.mgr.SetRuntimeOnly(false)
+			if err := api.mgr.SetRuntimeRules(&lsm.PolicySet{}, nil); err != nil && !softLSMError(err) {
+				return err
+			} else if err != nil {
 				logPolicyEvent("lsm.update.skip", map[string]any{"reason": err.Error()})
-			} else {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-				return
 			}
+			api.mode = "enforce"
+			api.mu.Lock()
+			api.cedarPrev = ""
+			api.mu.Unlock()
+		} else if permitAllMode {
+			api.mu.Lock()
+			api.cedarPrev = updated
+			api.mu.Unlock()
 		}
-		api.mode = "enforce"
-		api.mu.Lock()
-		api.cedarPrev = ""
-		api.cedarRuntime = updated
-		api.mu.Unlock()
+		return nil
+	}); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
 	}
 
 	logPolicyEvent("policy.patch", map[string]any{
@@ -594,25 +587,24 @@ func (api *policyAPI) handlePersistPolicies(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	prevFile, prevHTTP, _, _ := api.mgr.Snapshot()
-	if err := api.mgr.UpdateFileRules(compilation.Policies, compilation.HTTPRules); err != nil {
-		if softLSMError(err) {
+	// Safe transaction: commit the complete generation (including canonical
+	// file) first; the file layer update rolls back on post-processing failure.
+	if _, err := api.commitPolicyTransaction(cedar, "persist", true, func() error {
+		if err := api.mgr.UpdateFileRules(compilation.Policies, compilation.HTTPRules); err != nil && !softLSMError(err) {
+			return err
+		} else if err != nil {
 			logPolicyEvent("lsm.update.skip", map[string]any{"reason": err.Error()})
-		} else {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-			return
 		}
-	}
-
-	// If currently enforcing, clear runtime overlays so file layer is authoritative.
-	if api.mode == "enforce" {
-		_ = api.mgr.SetRuntimeRules(&lsm.PolicySet{}, nil)
-	}
-
-	if err := api.saveCanonicalCedar([]byte(cedar)); err != nil {
-		// Roll back file layer to last-good state.
-		_ = api.mgr.UpdateFileRules(prevFile, prevHTTP)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": fmt.Sprintf("failed to persist Cedar: %v", err)})
+		if api.mode == "enforce" {
+			if err := api.mgr.SetRuntimeRules(&lsm.PolicySet{}, nil); err != nil && !softLSMError(err) {
+				return err
+			} else if err != nil {
+				logPolicyEvent("lsm.update.skip", map[string]any{"reason": err.Error()})
+			}
+		}
+		return nil
+	}); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
 
@@ -1223,62 +1215,99 @@ func getLeashDirFromEnv() string {
 	return "/leash"
 }
 
-func saveCedarRuntime(b []byte) error {
-	dir := getLeashDirFromEnv()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, "cedar-runtime-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
-		return err
-	}
-	return os.Rename(tmpPath, filepath.Join(dir, "cedar-runtime.cedar"))
+// layerSnapshot captures the full in-memory enforcement state so a failed
+// transaction can restore every layer to its pre-transaction values.
+type layerSnapshot struct {
+	fileLSM      *lsm.PolicySet
+	fileHTTP     []proxy.HeaderRewriteRule
+	runtimeLSM   *lsm.PolicySet
+	runtimeHTTP  []proxy.HeaderRewriteRule
+	runtimeOnly  bool
+	cedarRuntime string
+	cedarPrev    string
+	mode         string
 }
 
-func (api *policyAPI) saveCanonicalCedar(b []byte) error {
-	path := strings.TrimSpace(api.policyPath)
-	if path == "" {
-		return fmt.Errorf("canonical Cedar path not configured")
+// snapshotLayers records every piece of mutable policy state for rollback.
+func (api *policyAPI) snapshotLayers() layerSnapshot {
+	fileLSM, fileHTTP, runtimeLSM, runtimeHTTP := api.mgr.Snapshot()
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return layerSnapshot{
+		fileLSM:      fileLSM,
+		fileHTTP:     fileHTTP,
+		runtimeLSM:   runtimeLSM,
+		runtimeHTTP:  runtimeHTTP,
+		runtimeOnly:  api.mgr.RuntimeOnly(),
+		cedarRuntime: api.cedarRuntime,
+		cedarPrev:    api.cedarPrev,
+		mode:         api.mode,
 	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
+}
+
+// restoreLayers rolls in-memory enforcement back to a captured snapshot.
+func (api *policyAPI) restoreLayers(snap layerSnapshot) {
+	_ = api.mgr.SetRuntimeOnly(snap.runtimeOnly)
+	_ = api.mgr.SetRuntimeRules(snap.runtimeLSM, snap.runtimeHTTP)
+	_ = api.mgr.UpdateFileRules(snap.fileLSM, snap.fileHTTP)
+	api.mu.Lock()
+	api.cedarRuntime = snap.cedarRuntime
+	api.cedarPrev = snap.cedarPrev
+	api.mu.Unlock()
+	api.mode = snap.mode
+}
+
+// publishGeneration durably commits cedar as a complete generation before
+// in-memory enforcement is mutated. Re-writing the same Cedar is idempotent.
+func (api *policyAPI) publishGeneration(cedar, source string) (generationID string, changed bool, err error) {
+	if api.genStore == nil {
+		return "", false, errors.New("policy generation store is not initialized")
 	}
-	tmp, err := os.CreateTemp(dir, "cedar-file-*.tmp")
+	gen, changed, err := api.genStore.Commit(cedar)
 	if err != nil {
-		return err
+		logPolicyEvent("policy.generation.commit", map[string]any{
+			"source": source,
+			"error":  err.Error(),
+		})
+		return "", false, err
 	}
-	tmpPath := tmp.Name()
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return err
+	logPolicyEvent("policy.generation.commit", map[string]any{
+		"source":     source,
+		"generation": gen.ID,
+		"changed":    changed,
+	})
+	return gen.ID, changed, nil
+}
+
+// commitPolicyTransaction runs the safe policy-write transaction used by every
+// public policy endpoint: persist a complete generation first, then apply
+// in-memory layers; on post-processing failure roll every layer back while the
+// durable generation stays recoverable on the next cold start.
+func (api *policyAPI) commitPolicyTransaction(cedar, source string, skipUnchanged bool, apply func() error) (changed bool, err error) {
+	snap := api.snapshotLayers()
+
+	generationID, changed, err := api.publishGeneration(cedar, source)
+	if err != nil {
+		return false, err
 	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return err
+	if skipUnchanged && !changed {
+		return false, nil
 	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
-		return err
+
+	if applyErr := apply(); applyErr != nil {
+		api.restoreLayers(snap)
+		logPolicyEvent("policy.generation.rollback", map[string]any{
+			"source":     source,
+			"generation": generationID,
+			"error":      applyErr.Error(),
+		})
+		return changed, fmt.Errorf("policy post-processing failed; rolled back to previous generation: %w", applyErr)
 	}
-	return os.Rename(tmpPath, path)
+
+	api.mu.Lock()
+	api.cedarRuntime = strings.TrimSpace(cedar)
+	api.mu.Unlock()
+	return changed, nil
 }
 
 func loadCedarRuntime() ([]byte, error) {
@@ -1688,21 +1717,19 @@ func (api *policyAPI) addPolicyStatement(newCedar string) (map[string]any, int, 
 	if err := ensureConnectSafety(lsmRules); err != nil {
 		return nil, http.StatusBadRequest, err
 	}
-	if err := api.mgr.SetRuntimeRules(lsmRules, httpRules); err != nil {
-		if softLSMError(err) {
+
+	// Safe transaction: publish the full generation first; roll the runtime
+	// overlay back on post-processing failure.
+	if _, err := api.commitPolicyTransaction(updated, "add", true, func() error {
+		if err := api.mgr.SetRuntimeRules(lsmRules, httpRules); err != nil && !softLSMError(err) {
+			return err
+		} else if err != nil {
 			logPolicyEvent("lsm.update.skip", map[string]any{"reason": err.Error()})
-		} else {
-			return nil, http.StatusInternalServerError, err
 		}
+		return nil
+	}); err != nil {
+		return nil, http.StatusInternalServerError, err
 	}
-
-	if err := saveCedarRuntime([]byte(updated)); err != nil {
-		logPolicyEvent("policy.add", map[string]any{"error": err.Error(), "persist": "cedar-runtime"})
-	}
-
-	api.mu.Lock()
-	api.cedarRuntime = updated
-	api.mu.Unlock()
 
 	logPolicyEvent("policy.add", map[string]any{"id": newPolicy.ID})
 
@@ -2007,38 +2034,23 @@ func (api *policyAPI) deletePolicy(req deletePolicyRequest) (map[string]any, int
 	if err := ensureConnectSafety(lsmRules); err != nil {
 		return nil, http.StatusBadRequest, err
 	}
-	if err := api.mgr.SetRuntimeRules(lsmRules, httpRules); err != nil {
-		if softLSMError(err) {
+
+	// Safe transaction: publish the complete generation (including canonical
+	// file) first; both layers roll back to the previous generation on failure.
+	if _, err := api.commitPolicyTransaction(updated, "delete", true, func() error {
+		if err := api.mgr.SetRuntimeRules(lsmRules, httpRules); err != nil && !softLSMError(err) {
+			return err
+		} else if err != nil {
 			logPolicyEvent("lsm.update.skip", map[string]any{"reason": err.Error()})
-		} else {
-			return nil, http.StatusInternalServerError, err
 		}
-	}
-
-	if err := saveCedarRuntime([]byte(updated)); err != nil {
-		logPolicyEvent("policy.delete", map[string]any{"error": err.Error(), "persist": "cedar-runtime"})
-	}
-
-	api.mu.Lock()
-	api.cedarRuntime = updated
-	api.mu.Unlock()
-
-	prevFile, prevHTTP, _, _ := api.mgr.Snapshot()
-	if err := api.mgr.UpdateFileRules(lsmRules, httpRules); err != nil {
-		if softLSMError(err) {
+		if err := api.mgr.UpdateFileRules(lsmRules, httpRules); err != nil && !softLSMError(err) {
+			return err
+		} else if err != nil {
 			logPolicyEvent("lsm.update.skip", map[string]any{"reason": err.Error()})
-		} else {
-			return nil, http.StatusInternalServerError, err
 		}
-	}
-
-	payload := strings.TrimSpace(updated)
-	if payload != "" && !strings.HasSuffix(payload, "\n") {
-		payload += "\n"
-	}
-	if err := api.saveCanonicalCedar([]byte(payload)); err != nil {
-		_ = api.mgr.UpdateFileRules(prevFile, prevHTTP)
-		return nil, http.StatusInternalServerError, fmt.Errorf("failed to persist Cedar: %w", err)
+		return nil
+	}); err != nil {
+		return nil, http.StatusInternalServerError, err
 	}
 
 	logPolicyEvent("policy.delete", map[string]any{

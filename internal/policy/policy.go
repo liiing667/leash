@@ -1,6 +1,8 @@
 package policy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -43,9 +45,13 @@ func Parse(path string) (*Config, error) {
 	}, nil
 }
 
-// WatchCedar polls the Cedar file and invokes onUpdate when a new valid
-// configuration is available. When compilation fails, onError receives the
-// structured Cedar error while the previous configuration remains active.
+// WatchCedar polls the Cedar file and invokes onUpdate only when a new,
+// complete policy generation is available.
+//
+// A generation is published to onUpdate only when the file is fully readable
+// and compiles successfully: a torn write or invalid Cedar keeps the previous
+// configuration active and is reported through onError. Re-writing identical
+// policy content (even with a newer mtime) is idempotent and does not re-publish.
 func WatchCedar(path string, interval time.Duration, onUpdate func(*Config), onError func(*cedar.ErrorDetail)) (func(), error) {
 	stat, err := os.Stat(path)
 	if err != nil {
@@ -55,11 +61,23 @@ func WatchCedar(path string, interval time.Duration, onUpdate func(*Config), onE
 	stop := make(chan struct{})
 	ticker := time.NewTicker(interval)
 
+	// Capture the initial content fingerprint synchronously (before the
+	// goroutine is scheduled) so a rapid write after WatchCedar returns is
+	// detected as a new generation rather than mistaken for the baseline.
+	initialFingerprint := ""
+	if b, readErr := os.ReadFile(path); readErr == nil {
+		sum := sha256.Sum256(b)
+		initialFingerprint = hex.EncodeToString(sum[:])
+	}
+
 	go func(initialModTime time.Time) {
 		defer ticker.Stop()
 		// Track the last successful mod time separately so partial writes keep retrying until a valid config is parsed.
 		lastSuccessModTime := initialModTime
 		var lastErrorModTime time.Time
+		// lastFingerprint records the content hash of the last generation we
+		// published so identical rewrites do not re-emit an update.
+		lastFingerprint := initialFingerprint
 
 		for {
 			select {
@@ -84,6 +102,26 @@ func WatchCedar(path string, interval time.Duration, onUpdate func(*Config), onE
 					continue
 				}
 
+				// Read the full document first and gate on its content
+				// fingerprint so only a complete new generation is published.
+				raw, readErr := os.ReadFile(path)
+				if readErr != nil {
+					if onError != nil && !info.ModTime().Equal(lastErrorModTime) {
+						onError(&cedar.ErrorDetail{
+							Summary:    "failed to read Cedar policy file",
+							Message:    fmt.Sprintf("failed to read Cedar policy file %q: %v", path, readErr),
+							File:       path,
+							Suggestion: "Ensure the Cedar file remains accessible to the leash daemon.",
+							Code:       "CEDAR_IO",
+							Raw:        readErr,
+						})
+					}
+					lastErrorModTime = info.ModTime()
+					continue
+				}
+				sum := sha256.Sum256(raw)
+				fingerprint := hex.EncodeToString(sum[:])
+
 				cfg, parseErr := Parse(path)
 				if parseErr != nil {
 					var detail *cedar.ErrorDetail
@@ -105,9 +143,18 @@ func WatchCedar(path string, interval time.Duration, onUpdate func(*Config), onE
 					continue
 				}
 
+				// Identical content is the same generation: stay idempotent and
+				// do not re-publish, but advance the watermark to avoid re-reading.
+				if fingerprint == lastFingerprint {
+					lastSuccessModTime = info.ModTime()
+					lastErrorModTime = time.Time{}
+					continue
+				}
+
 				cfg.lastModTime = info.ModTime()
 				lastSuccessModTime = info.ModTime()
 				lastErrorModTime = time.Time{}
+				lastFingerprint = fingerprint
 				if onUpdate != nil {
 					onUpdate(cfg)
 				}
@@ -414,6 +461,14 @@ func (m *Manager) SetRuntimeOnly(enabled bool) error {
 	m.runtimeOnly = enabled
 	m.runtimeMutex.Unlock()
 	return m.applyChanges()
+}
+
+// RuntimeOnly reports whether the Manager ignores the file layer when
+// computing active rules.
+func (m *Manager) RuntimeOnly() bool {
+	m.runtimeMutex.RLock()
+	defer m.runtimeMutex.RUnlock()
+	return m.runtimeOnly
 }
 
 // Snapshot returns copies of file and runtime rule layers for safe inspection.

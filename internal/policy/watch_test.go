@@ -71,6 +71,71 @@ func TestWatchCedarHandlesUpdatesAndErrors(t *testing.T) {
 	}
 }
 
+// TestWatchCedarIdempotentForIdenticalContent verifies the persistent consumer
+// only publishes a new generation when the content actually changes. Re-writing
+// the same Cedar (with a newer mtime) must not re-invoke onUpdate.
+func TestWatchCedarIdempotentForIdenticalContent(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy.cedar")
+
+	initial := `permit (
+    principal,
+    action == Action::"FileOpen",
+    resource == Dir::"/tmp"
+);`
+	writeCedar(t, path, initial)
+
+	updateCh := make(chan *Config, 4)
+	errorCh := make(chan *cedarutil.ErrorDetail, 2)
+
+	cancel, err := WatchCedar(path, 20*time.Millisecond, func(cfg *Config) {
+		updateCh <- cfg
+	}, func(detail *cedarutil.ErrorDetail) {
+		errorCh <- detail
+	})
+	if err != nil {
+		t.Fatalf("WatchCedar returned error: %v", err)
+	}
+	defer cancel()
+
+	// A genuinely new generation publishes exactly one update.
+	next := `permit (
+    principal,
+    action == Action::"FileOpen",
+    resource == Dir::"/var"
+);`
+	writeCedar(t, path, next)
+	expectConfig(t, updateCh, "watcher update for new generation")
+
+	// Re-write identical content with an advancing mtime: no new publication.
+	writeCedar(t, path, next)
+	writeCedar(t, path, next)
+
+	select {
+	case cfg := <-updateCh:
+		t.Fatalf("identical content re-published a generation: %+v", cfg)
+	case <-time.After(200 * time.Millisecond):
+		// Expected: no update for the same generation.
+	}
+
+	// A subsequent distinct generation is still published normally.
+	recovery := `permit (
+    principal,
+    action == Action::"FileOpen",
+    resource == Dir::"/home"
+);`
+	writeCedar(t, path, recovery)
+	expectConfig(t, updateCh, "watcher update after distinct generation")
+
+	select {
+	case detail := <-errorCh:
+		t.Fatalf("unexpected watcher error: %v", detail)
+	default:
+	}
+}
+
 func writeCedar(t *testing.T, path, cedar string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(strings.TrimSpace(cedar)+"\n"), 0o644); err != nil {
