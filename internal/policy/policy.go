@@ -121,6 +121,13 @@ func WatchCedar(path string, interval time.Duration, onUpdate func(*Config), onE
 
 // ParseHTTPRuleString parses an HTTP rewrite rule string into a HeaderRewriteRule
 func ParseHTTPRuleString(ruleStr string) (*proxy.HeaderRewriteRule, error) {
+	// Reject CR/LF before tokenizing: strings.Fields would otherwise split the
+	// line into separate tokens and silently discard the injected characters,
+	// masking a header-injection attempt.
+	if strings.ContainsAny(ruleStr, "\r\n") {
+		return nil, fmt.Errorf("invalid HTTP rewrite rule format: CR/LF characters are not allowed")
+	}
+
 	// Parse: "allow http.rewrite <host> header:<header>:<value>"
 	parts := strings.Fields(ruleStr)
 	if len(parts) < 4 {
@@ -152,11 +159,19 @@ func ParseHTTPRuleString(ruleStr string) (*proxy.HeaderRewriteRule, error) {
 		headerValue += " " + strings.Join(parts[4:], " ")
 	}
 
-	return &proxy.HeaderRewriteRule{
+	rule := &proxy.HeaderRewriteRule{
 		Host:   host,
 		Header: headerName,
 		Value:  headerValue,
-	}, nil
+	}
+
+	// Reject ambiguous header content (CR/LF injection, invalid header names
+	// or values) at the public parsing boundary so such rules can never reach
+	// the proxy or be persisted.
+	if err := proxy.ValidateHeaderRewriteRule(*rule); err != nil {
+		return nil, err
+	}
+	return rule, nil
 }
 
 // Manager manages both file-based and runtime policy rules
@@ -191,12 +206,19 @@ type PolicySetCompat = lsm.PolicySet
 // AddRule adds a rule at runtime
 func (m *Manager) AddRule(ruleStr string) error {
 	m.runtimeMutex.Lock()
-	defer m.runtimeMutex.Unlock()
 
 	// Check if it's an HTTP rewrite rule
 	if strings.Contains(ruleStr, "http.rewrite") {
 		httpRule, err := ParseHTTPRuleString(ruleStr)
 		if err != nil {
+			m.runtimeMutex.Unlock()
+			return fmt.Errorf("invalid HTTP rule: %w", err)
+		}
+		// Validate against the existing runtime set: a rule that duplicates an
+		// existing host/header target must be rejected without mutating state.
+		candidate := append(append([]proxy.HeaderRewriteRule(nil), m.runtimeHTTPRules...), *httpRule)
+		if err := proxy.ValidateHeaderRewriteRules(candidate); err != nil {
+			m.runtimeMutex.Unlock()
 			return fmt.Errorf("invalid HTTP rule: %w", err)
 		}
 		m.runtimeHTTPRules = append(m.runtimeHTTPRules, *httpRule)
@@ -204,6 +226,7 @@ func (m *Manager) AddRule(ruleStr string) error {
 		// LSM rule
 		rule, err := lsm.ParseRuleString(ruleStr)
 		if err != nil {
+			m.runtimeMutex.Unlock()
 			return fmt.Errorf("invalid LSM rule: %w", err)
 		}
 
@@ -217,14 +240,16 @@ func (m *Manager) AddRule(ruleStr string) error {
 			m.runtimeRules.Connect = append(m.runtimeRules.Connect, *rule)
 		}
 	}
+	m.runtimeMutex.Unlock()
 
+	// applyChanges re-acquires runtimeMutex via GetActiveRules, so the lock
+	// must be released first.
 	return m.applyChanges()
 }
 
 // RemoveRule removes a rule at runtime
 func (m *Manager) RemoveRule(ruleStr string) error {
 	m.runtimeMutex.Lock()
-	defer m.runtimeMutex.Unlock()
 
 	// Check if it's an HTTP rewrite rule
 	if strings.Contains(ruleStr, "http.rewrite") {
@@ -235,7 +260,10 @@ func (m *Manager) RemoveRule(ruleStr string) error {
 		m.runtimeRules.Exec = m.removeLSMRuleFromSlice(m.runtimeRules.Exec, ruleStr)
 		m.runtimeRules.Connect = m.removeLSMRuleFromSlice(m.runtimeRules.Connect, ruleStr)
 	}
+	m.runtimeMutex.Unlock()
 
+	// applyChanges re-acquires runtimeMutex via GetActiveRules, so the lock
+	// must be released first.
 	return m.applyChanges()
 }
 
@@ -289,6 +317,11 @@ func (m *Manager) GetActiveRules() (*lsm.PolicySet, []proxy.HeaderRewriteRule) {
 
 // UpdateFileRules updates the file-based rules
 func (m *Manager) UpdateFileRules(newFileRules *lsm.PolicySet, newHTTPRules []proxy.HeaderRewriteRule) error {
+	// Reject ambiguous header rewrite rules wholesale; the previous file layer
+	// stays active and no partial rule set is pushed to the proxy.
+	if err := proxy.ValidateHeaderRewriteRules(newHTTPRules); err != nil {
+		return fmt.Errorf("invalid HTTP header rewrite rules in policy file: %w", err)
+	}
 	m.runtimeMutex.Lock()
 	m.fileRules = newFileRules
 	m.fileHTTPRules = newHTTPRules
@@ -389,6 +422,12 @@ func (m *Manager) applyChanges() error {
 
 // SetRuntimeRules replaces the current runtime rule layers atomically.
 func (m *Manager) SetRuntimeRules(newLSM *lsm.PolicySet, newHTTP []proxy.HeaderRewriteRule) error {
+	// Validate the full candidate HTTP rule set before touching any state so a
+	// batch containing an ambiguous rule fails as a whole instead of partially
+	// reaching the proxy.
+	if err := proxy.ValidateHeaderRewriteRules(newHTTP); err != nil {
+		return fmt.Errorf("invalid HTTP header rewrite rules: %w", err)
+	}
 	m.runtimeMutex.Lock()
 	// Defensive copies
 	rr := &lsm.PolicySet{

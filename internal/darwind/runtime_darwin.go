@@ -487,7 +487,11 @@ func initRuntime(cfg *runtimeConfig) (*runtimeState, error) {
 	}
 
 	policyManager := policy.NewManager(lsmManager, func(rules *lsm.PolicySet, httpRules []proxy.HeaderRewriteRule) {
-		state.headerRewriter.SetRules(httpRules)
+		if err := state.headerRewriter.SetRules(httpRules); err != nil {
+			// The candidate set is ambiguous; keep the previously active rules.
+			logPolicyEvent("policy.update", map[string]any{"source": "runtime", "error": err.Error()})
+			return
+		}
 		if state.mitmProxy != nil {
 			applyPolicyToProxy(state.mitmProxy, rules)
 		}
@@ -497,7 +501,10 @@ func initRuntime(cfg *runtimeConfig) (*runtimeState, error) {
 		state.Close()
 		return nil, fmt.Errorf("failed to load file policies: %w", err)
 	}
-	headerRewriter.SetRules(initialPolicy.HTTPRewrites)
+	if err := headerRewriter.SetRules(initialPolicy.HTTPRewrites); err != nil {
+		state.Close()
+		return nil, fmt.Errorf("failed to load header rewrite rules: %w", err)
+	}
 	if mitmProxy != nil {
 		applyPolicyToProxy(mitmProxy, initialPolicy.LSMPolicies)
 	}

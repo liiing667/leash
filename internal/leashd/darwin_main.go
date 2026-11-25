@@ -95,13 +95,18 @@ func MainDarwin(args []string) error {
 	headerRewriter.SetSharedLogger(logger)
 
 	policyManager := policy.NewManager(nil, func(_ *lsm.PolicySet, httpRules []proxy.HeaderRewriteRule) {
-		headerRewriter.SetRules(httpRules)
+		if err := headerRewriter.SetRules(httpRules); err != nil {
+			// Rejected wholesale; retain the previously active rewrite rules.
+			logPolicyEvent("policy.update", map[string]any{"source": "runtime", "error": err.Error()})
+		}
 	})
 
 	if err := policyManager.UpdateFileRules(cfg.LSMPolicies, cfg.HTTPRewrites); err != nil {
 		return fmt.Errorf("failed to load file policies: %w", err)
 	}
-	headerRewriter.SetRules(cfg.HTTPRewrites)
+	if err := headerRewriter.SetRules(cfg.HTTPRewrites); err != nil {
+		return fmt.Errorf("failed to load header rewrite rules: %w", err)
+	}
 
 	var policyReady atomic.Bool
 	policyReady.Store(true)
@@ -172,7 +177,10 @@ func serveDarwinHTTP(
 			logPolicyEvent("policy.update", map[string]any{"source": "file", "error": err.Error()})
 			return
 		}
-		headerRewriter.SetRules(newCfg.HTTPRewrites)
+		if err := headerRewriter.SetRules(newCfg.HTTPRewrites); err != nil {
+			logPolicyEvent("policy.update", map[string]any{"source": "file", "error": err.Error()})
+			return
+		}
 		logPolicyEvent("policy.update", map[string]any{
 			"source":        "file",
 			"lsm_open":      len(newCfg.LSMPolicies.Open),

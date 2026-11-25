@@ -113,6 +113,14 @@ func (t *CedarToLeashTranspiler) TranspilePolicySet(policySet *CedarPolicySet) (
 		}
 	}
 
+	// Validate the complete HTTP rewrite set before returning it. Ambiguous
+	// rules (CR/LF injection, invalid header names or values) and duplicate
+	// host/header targets fail the whole compilation so no partial, unsafe
+	// rule set is ever published to the proxy.
+	if err := proxy.ValidateHeaderRewriteRules(httpRewrites); err != nil {
+		return nil, nil, fmt.Errorf("invalid HTTP header rewrite policy: %w", err)
+	}
+
 	applyConnectDefaults(leashPolicies)
 	return leashPolicies, httpRewrites, nil
 }
