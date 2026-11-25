@@ -275,8 +275,12 @@ type patchPolicyRemove struct {
 }
 
 func (api *policyAPI) respondPolicies(w http.ResponseWriter, resp map[string]any) {
-	writeJSON(w, http.StatusOK, resp)
+	// Broadcast the audit snapshot before responding so the public event
+	// spool holds recoverable evidence of the submission before it is
+	// allowed; a failed or dropped broadcast must not leave the spool
+	// empty once the decision is visible to the client.
 	api.broadcastPolicySnapshot(resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (api *policyAPI) broadcastPolicySnapshot(resp map[string]any) {

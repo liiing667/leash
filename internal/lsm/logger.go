@@ -56,14 +56,11 @@ func (l *SharedLogger) Write(entry string) error {
 		entry += "\n"
 	}
 
-	// Write to file when configured
-	if l.file != nil {
-		if _, err := l.file.WriteString(entry); err != nil {
-			return err
-		}
-	}
-
-	// Broadcast to websocket clients (if broadcaster is set)
+	// Broadcast to websocket clients (if broadcaster is set) before touching
+	// the disk. The public event spool must carry recoverable evidence of the
+	// audit event even when the file write below fails: callers proceed to
+	// allow or deny the operation once Write returns, so a disk error must
+	// not leave the spool empty.
 	if l.broadcaster != nil {
 		// Remove the newline for broadcasting
 		broadcastEntry := entry
@@ -73,7 +70,11 @@ func (l *SharedLogger) Write(entry string) error {
 		l.broadcaster.BroadcastLog(broadcastEntry)
 	}
 
+	// Write to file when configured
 	if l.file != nil {
+		if _, err := l.file.WriteString(entry); err != nil {
+			return err
+		}
 		return l.file.Sync()
 	}
 	return nil
