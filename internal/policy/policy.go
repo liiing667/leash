@@ -168,9 +168,116 @@ type Manager struct {
 	runtimeMutex     sync.RWMutex
 	runtimeOnly      bool // when true, active rules are runtime-only (ignore file layer)
 
+	// overlayGeneration identifies the currently committed runtime overlay
+	// generation. It is owned by the Manager so HTTP snapshots, proxy
+	// consumers, and process reopen/recovery can observe the same value.
+	overlayGeneration int64
+	overlayActive     bool
+	overlaySource     string
+	overlayToken      string
+
 	// Subsystem references for live updates
 	lsmManager   *lsm.LSMManager
 	proxyUpdater func(*lsm.PolicySet, []proxy.HeaderRewriteRule) // Callback to update proxy
+}
+
+// OverlayInfo is the stable, copyable view of a runtime overlay generation.
+type OverlayInfo struct {
+	Generation  int64  `json:"generation"`
+	Active      bool   `json:"active"`
+	RuntimeOnly bool   `json:"runtimeOnly"`
+	Source      string `json:"source,omitempty"`
+	Token       string `json:"token,omitempty"`
+}
+
+// Generation returns the current runtime overlay generation. Generation is
+// retained as a concise accessor for consumers that treat policy and overlay
+// generations as the same commit sequence.
+func (m *Manager) Generation() int64 {
+	return m.OverlayGeneration()
+}
+
+// CurrentGeneration is an explicitly named accessor for public consumers.
+func (m *Manager) CurrentGeneration() int64 { return m.OverlayGeneration() }
+
+// GetGeneration keeps getter-style call sites readable.
+func (m *Manager) GetGeneration() int64 { return m.OverlayGeneration() }
+
+// OverlayGeneration returns the current runtime overlay generation.
+func (m *Manager) OverlayGeneration() int64 {
+	m.runtimeMutex.RLock()
+	defer m.runtimeMutex.RUnlock()
+	return m.overlayGeneration
+}
+
+// CurrentOverlayGeneration aliases OverlayGeneration.
+func (m *Manager) CurrentOverlayGeneration() int64 { return m.OverlayGeneration() }
+
+// GetOverlayGeneration aliases OverlayGeneration.
+func (m *Manager) GetOverlayGeneration() int64 { return m.OverlayGeneration() }
+
+// OverlayActive reports whether the runtime overlay currently contains rules.
+func (m *Manager) OverlayActive() bool {
+	m.runtimeMutex.RLock()
+	defer m.runtimeMutex.RUnlock()
+	return m.overlayActive
+}
+
+// OverlaySnapshot returns the generation-bound overlay identity. The rule
+// layers themselves remain available through Snapshot for compatibility.
+func (m *Manager) OverlaySnapshot() OverlayInfo {
+	m.runtimeMutex.RLock()
+	defer m.runtimeMutex.RUnlock()
+	return OverlayInfo{
+		Generation:  m.overlayGeneration,
+		Active:      m.overlayActive,
+		RuntimeOnly: m.runtimeOnly,
+		Source:      m.overlaySource,
+		Token:       m.overlayToken,
+	}
+}
+
+// SetOverlayGeneration adopts a durable generation without publishing rules.
+// It is used during process reopen before the persisted overlay is restored.
+func (m *Manager) SetOverlayGeneration(generation int64) {
+	m.runtimeMutex.Lock()
+	defer m.runtimeMutex.Unlock()
+	if generation > m.overlayGeneration {
+		m.overlayGeneration = generation
+	}
+}
+
+// SetGeneration aliases SetOverlayGeneration.
+func (m *Manager) SetGeneration(generation int64) { m.SetOverlayGeneration(generation) }
+
+// SetOverlayIdentity adopts the complete durable overlay identity. This is
+// intentionally separate from SetRuntimeRules so startup can restore an old
+// generation instead of accidentally publishing a new one.
+func (m *Manager) SetOverlayIdentity(info OverlayInfo) {
+	m.runtimeMutex.Lock()
+	defer m.runtimeMutex.Unlock()
+	if info.Generation > m.overlayGeneration {
+		m.overlayGeneration = info.Generation
+	}
+	m.overlayActive = info.Active
+	m.runtimeOnly = info.RuntimeOnly
+	m.overlaySource = info.Source
+	m.overlayToken = info.Token
+	if m.runtimeRules != nil {
+		m.runtimeRules.Generation = m.overlayGeneration
+		m.runtimeRules.OverlayGeneration = m.overlayGeneration
+		m.runtimeRules.Source = m.overlaySource
+	}
+}
+
+// AdvanceOverlayGeneration publishes a new empty overlay generation and
+// returns it. Callers should invoke this only after the durable commit has
+// succeeded.
+func (m *Manager) AdvanceOverlayGeneration() int64 {
+	m.runtimeMutex.Lock()
+	defer m.runtimeMutex.Unlock()
+	m.overlayGeneration++
+	return m.overlayGeneration
 }
 
 // NewManager creates a new policy manager
@@ -253,6 +360,9 @@ func (m *Manager) GetActiveRules() (*lsm.PolicySet, []proxy.HeaderRewriteRule) {
 			MCP:                    append([]lsm.MCPPolicyRule(nil), m.runtimeRules.MCP...),
 			ConnectDefaultAllow:    m.runtimeRules.ConnectDefaultAllow,
 			ConnectDefaultExplicit: m.runtimeRules.ConnectDefaultExplicit,
+			Generation:             m.overlayGeneration,
+			OverlayGeneration:      m.overlayGeneration,
+			Source:                 m.overlaySource,
 		}
 		rh := append([]proxy.HeaderRewriteRule(nil), m.runtimeHTTPRules...)
 		return rr, rh
@@ -265,6 +375,9 @@ func (m *Manager) GetActiveRules() (*lsm.PolicySet, []proxy.HeaderRewriteRule) {
 		MCP:                    append([]lsm.MCPPolicyRule{}, m.runtimeRules.MCP...),
 		ConnectDefaultAllow:    m.fileRules.ConnectDefaultAllow,
 		ConnectDefaultExplicit: m.fileRules.ConnectDefaultExplicit,
+		Generation:             m.overlayGeneration,
+		OverlayGeneration:      m.overlayGeneration,
+		Source:                 m.overlaySource,
 	}
 	mergedLSM.Open = append(mergedLSM.Open, m.fileRules.Open...)
 	mergedLSM.Exec = append(mergedLSM.Exec, m.fileRules.Exec...)
@@ -389,21 +502,53 @@ func (m *Manager) applyChanges() error {
 
 // SetRuntimeRules replaces the current runtime rule layers atomically.
 func (m *Manager) SetRuntimeRules(newLSM *lsm.PolicySet, newHTTP []proxy.HeaderRewriteRule) error {
+	return m.SetRuntimeRulesWithGeneration(newLSM, newHTTP, 0)
+}
+
+// SetRuntimeRulesWithGeneration replaces the runtime layers and binds them to
+// generation. A zero generation publishes the next in-memory generation; a
+// positive generation is used when restoring a durable overlay.
+func (m *Manager) SetRuntimeRulesWithGeneration(newLSM *lsm.PolicySet, newHTTP []proxy.HeaderRewriteRule, generation int64) error {
 	m.runtimeMutex.Lock()
 	// Defensive copies
-	rr := &lsm.PolicySet{
-		Open:                   append([]lsm.PolicyRule(nil), newLSM.Open...),
-		Exec:                   append([]lsm.PolicyRule(nil), newLSM.Exec...),
-		Connect:                append([]lsm.PolicyRule(nil), newLSM.Connect...),
-		MCP:                    append([]lsm.MCPPolicyRule(nil), newLSM.MCP...),
-		ConnectDefaultAllow:    newLSM.ConnectDefaultAllow,
-		ConnectDefaultExplicit: newLSM.ConnectDefaultExplicit,
+	rr := &lsm.PolicySet{}
+	if newLSM != nil {
+		rr.Open = append([]lsm.PolicyRule(nil), newLSM.Open...)
+		rr.Exec = append([]lsm.PolicyRule(nil), newLSM.Exec...)
+		rr.Connect = append([]lsm.PolicyRule(nil), newLSM.Connect...)
+		rr.MCP = append([]lsm.MCPPolicyRule(nil), newLSM.MCP...)
+		rr.ConnectDefaultAllow = newLSM.ConnectDefaultAllow
+		rr.ConnectDefaultExplicit = newLSM.ConnectDefaultExplicit
 	}
 	rh := append([]proxy.HeaderRewriteRule(nil), newHTTP...)
 	m.runtimeRules = rr
 	m.runtimeHTTPRules = rh
+	m.overlayActive = runtimeOverlayHasRules(rr, rh)
+	if generation > 0 {
+		if generation > m.overlayGeneration {
+			m.overlayGeneration = generation
+		}
+	} else {
+		m.overlayGeneration++
+	}
+	rr.Generation = m.overlayGeneration
+	rr.OverlayGeneration = m.overlayGeneration
+	rr.Source = m.overlaySource
 	m.runtimeMutex.Unlock()
 	return m.applyChanges()
+}
+
+// RestoreRuntimeRules restores a durable runtime overlay without advancing its
+// generation.
+func (m *Manager) RestoreRuntimeRules(newLSM *lsm.PolicySet, newHTTP []proxy.HeaderRewriteRule, info OverlayInfo) error {
+	if info.Generation <= 0 {
+		info.Generation = m.OverlayGeneration()
+	}
+	if err := m.SetRuntimeRulesWithGeneration(newLSM, newHTTP, info.Generation); err != nil {
+		return err
+	}
+	m.SetOverlayIdentity(info)
+	return nil
 }
 
 // SetRuntimeOnly toggles whether the Manager should ignore the file layer when
@@ -412,8 +557,42 @@ func (m *Manager) SetRuntimeRules(newLSM *lsm.PolicySet, newHTTP []proxy.HeaderR
 func (m *Manager) SetRuntimeOnly(enabled bool) error {
 	m.runtimeMutex.Lock()
 	m.runtimeOnly = enabled
+	if !enabled {
+		// Leaving runtime-only mode returns authority to the file layer. If
+		// the runtime layer is also empty, this is an overlay deletion and a
+		// new generation must be observed by every consumer.
+		if !m.overlayActive {
+			m.overlayGeneration++
+		}
+	}
 	m.runtimeMutex.Unlock()
 	return m.applyChanges()
+}
+
+// ClearRuntimeOverlay atomically removes runtime rules, exits runtime-only
+// mode, and publishes a new overlay generation.
+func (m *Manager) ClearRuntimeOverlay() (int64, error) {
+	m.runtimeMutex.Lock()
+	m.runtimeRules = &lsm.PolicySet{}
+	m.runtimeHTTPRules = nil
+	m.runtimeOnly = false
+	m.overlayActive = false
+	m.overlaySource = "cleared"
+	m.overlayToken = ""
+	m.overlayGeneration++
+	generation := m.overlayGeneration
+	m.runtimeRules.Generation = generation
+	m.runtimeRules.OverlayGeneration = generation
+	m.runtimeRules.Source = "cleared"
+	m.runtimeMutex.Unlock()
+	return generation, m.applyChanges()
+}
+
+func runtimeOverlayHasRules(rules *lsm.PolicySet, httpRules []proxy.HeaderRewriteRule) bool {
+	if rules == nil {
+		return len(httpRules) > 0
+	}
+	return len(rules.Open)+len(rules.Exec)+len(rules.Connect)+len(rules.MCP)+len(httpRules) > 0
 }
 
 // Snapshot returns copies of file and runtime rule layers for safe inspection.
@@ -436,7 +615,39 @@ func (m *Manager) Snapshot() (fileLSM *lsm.PolicySet, fileHTTP []proxy.HeaderRew
 		ConnectDefaultAllow:    m.runtimeRules.ConnectDefaultAllow,
 		ConnectDefaultExplicit: m.runtimeRules.ConnectDefaultExplicit,
 	}
+	rl.Generation = m.overlayGeneration
+	rl.OverlayGeneration = m.overlayGeneration
+	rl.Source = m.overlaySource
 	fh := append([]proxy.HeaderRewriteRule(nil), m.fileHTTPRules...)
 	rh := append([]proxy.HeaderRewriteRule(nil), m.runtimeHTTPRules...)
 	return fl, fh, rl, rh
+}
+
+// SnapshotWithGeneration is the compatibility-preserving variant for
+// consumers that need the rule layers and overlay generation in one read.
+func (m *Manager) SnapshotWithGeneration() (fileLSM *lsm.PolicySet, fileHTTP []proxy.HeaderRewriteRule, runtimeLSM *lsm.PolicySet, runtimeHTTP []proxy.HeaderRewriteRule, generation int64) {
+	m.runtimeMutex.RLock()
+	defer m.runtimeMutex.RUnlock()
+	fl := &lsm.PolicySet{
+		Open:                   append([]lsm.PolicyRule(nil), m.fileRules.Open...),
+		Exec:                   append([]lsm.PolicyRule(nil), m.fileRules.Exec...),
+		Connect:                append([]lsm.PolicyRule(nil), m.fileRules.Connect...),
+		MCP:                    append([]lsm.MCPPolicyRule(nil), m.fileRules.MCP...),
+		ConnectDefaultAllow:    m.fileRules.ConnectDefaultAllow,
+		ConnectDefaultExplicit: m.fileRules.ConnectDefaultExplicit,
+	}
+	rl := &lsm.PolicySet{
+		Open:                   append([]lsm.PolicyRule(nil), m.runtimeRules.Open...),
+		Exec:                   append([]lsm.PolicyRule(nil), m.runtimeRules.Exec...),
+		Connect:                append([]lsm.PolicyRule(nil), m.runtimeRules.Connect...),
+		MCP:                    append([]lsm.MCPPolicyRule(nil), m.runtimeRules.MCP...),
+		ConnectDefaultAllow:    m.runtimeRules.ConnectDefaultAllow,
+		ConnectDefaultExplicit: m.runtimeRules.ConnectDefaultExplicit,
+	}
+	rl.Generation = m.overlayGeneration
+	rl.OverlayGeneration = m.overlayGeneration
+	rl.Source = m.overlaySource
+	fh := append([]proxy.HeaderRewriteRule(nil), m.fileHTTPRules...)
+	rh := append([]proxy.HeaderRewriteRule(nil), m.runtimeHTTPRules...)
+	return fl, fh, rl, rh, m.overlayGeneration
 }

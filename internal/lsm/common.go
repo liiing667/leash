@@ -67,6 +67,12 @@ type PolicySet struct {
 	Connect []PolicyRule
 	MCP     []MCPPolicyRule
 
+	// Generation binds an in-memory policy set to its committed overlay
+	// generation. It is metadata only and does not alter rule evaluation.
+	Generation        int64
+	OverlayGeneration int64
+	Source            string
+
 	// ConnectDefaultAllow indicates whether the default net.send posture is allow (true) or deny (false).
 	// ConnectDefaultExplicit tracks whether the default posture was explicitly configured in the policy file.
 	ConnectDefaultAllow    bool

@@ -43,9 +43,44 @@ type MITMProxy struct {
 	logMutex       sync.Mutex
 	sharedLogger   *lsm.SharedLogger // Shared event logger
 	policyChecker  PolicyChecker     // Connect policy enforcement
-	httpClient     *http.Client      // Custom HTTP client with marked connections
+	policyGenMu    sync.RWMutex
+	policyGen      int64
+	httpClient     *http.Client // Custom HTTP client with marked connections
 	tlsDialer      func(string) (*tls.Conn, error)
 	mcpObserver    *mcpObserver
+}
+
+// PolicyGenerationProvider is implemented by policy checkers that are bound to
+// a committed policy/overlay generation.
+type PolicyGenerationProvider interface {
+	PolicyGeneration() int64
+}
+
+// OverlayGenerationProvider is the alias used by runtime overlay consumers.
+type OverlayGenerationProvider interface {
+	OverlayGeneration() int64
+}
+
+type generationProvider interface {
+	Generation() int64
+}
+
+type generationedPolicyChecker struct {
+	PolicyChecker
+	generation int64
+}
+
+func (c generationedPolicyChecker) PolicyGeneration() int64  { return c.generation }
+func (c generationedPolicyChecker) OverlayGeneration() int64 { return c.generation }
+func (c generationedPolicyChecker) Generation() int64        { return c.generation }
+
+// WithPolicyGeneration binds a policy checker to a generation without changing
+// its allow/deny decisions.
+func WithPolicyGeneration(checker PolicyChecker, generation int64) PolicyChecker {
+	if checker == nil {
+		return nil
+	}
+	return generationedPolicyChecker{PolicyChecker: checker, generation: generation}
 }
 
 // sockaddr_in structure for SO_ORIGINAL_DST
@@ -237,9 +272,59 @@ func (p *MITMProxy) Run() error {
 // SetPolicyChecker updates the policy checker used for connect enforcement.
 func (p *MITMProxy) SetPolicyChecker(pc PolicyChecker) {
 	p.policyChecker = pc
+	generation := int64(0)
+	switch provider := pc.(type) {
+	case PolicyGenerationProvider:
+		generation = provider.PolicyGeneration()
+	case OverlayGenerationProvider:
+		generation = provider.OverlayGeneration()
+	case generationProvider:
+		generation = provider.Generation()
+	}
+	p.SetPolicyCheckerGeneration(pc, generation)
+}
+
+// SetPolicyCheckerGeneration installs pc and records the generation in one
+// consumer-visible commit point.
+func (p *MITMProxy) SetPolicyCheckerGeneration(pc PolicyChecker, generation int64) {
+	p.policyChecker = pc
+	p.policyGenMu.Lock()
+	p.policyGen = generation
+	p.policyGenMu.Unlock()
 	if p.mcpObserver != nil {
 		p.mcpObserver.setForceParse(pc != nil && pc.HasMCPPolicies())
 	}
+}
+
+// PolicyGeneration returns the generation last published to this proxy.
+func (p *MITMProxy) PolicyGeneration() int64 {
+	p.policyGenMu.RLock()
+	defer p.policyGenMu.RUnlock()
+	return p.policyGen
+}
+
+// SetPolicyGeneration records the generation when the checker itself cannot be
+// rewrapped by the wiring layer.
+func (p *MITMProxy) SetPolicyGeneration(generation int64) {
+	p.policyGenMu.Lock()
+	p.policyGen = generation
+	p.policyGenMu.Unlock()
+	if setter, ok := p.policyChecker.(interface{ SetGeneration(int64) }); ok {
+		setter.SetGeneration(generation)
+	}
+	if setter, ok := p.policyChecker.(interface{ SetPolicyGeneration(int64) }); ok {
+		setter.SetPolicyGeneration(generation)
+	}
+}
+
+// OverlayGeneration is the runtime-overlay name for PolicyGeneration.
+func (p *MITMProxy) OverlayGeneration() int64 {
+	return p.PolicyGeneration()
+}
+
+// Generation is the short alias for policy/overlay generation consumers.
+func (p *MITMProxy) Generation() int64 {
+	return p.PolicyGeneration()
 }
 
 func (p *MITMProxy) handleTransparentConnection(clientConn net.Conn) {

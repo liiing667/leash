@@ -35,10 +35,11 @@ type policyBroadcaster interface {
 // It accepts Cedar from the client, compiles it into in-memory rule sets for the
 // runtime/file layers, and persists Cedar for UX continuity and restarts.
 type policyAPI struct {
-	mgr          *policy.Manager
-	cedarRuntime string
-	cedarPrev    string
-	mu           sync.RWMutex
+	mgr               *policy.Manager
+	cedarRuntime      string
+	cedarPrev         string
+	mu                sync.RWMutex
+	overlayGeneration int64
 
 	// policyPath is the canonical Cedar file persisted for the file layer.
 	policyPath string
@@ -97,19 +98,80 @@ func newPolicyAPI(mgr *policy.Manager, policyPath string, broadcaster policyBroa
 			api.wsHub = h
 		}
 	}
-	// Attempt to restore runtime Cedar on startup
-	if b, err := loadCedarRuntime(); err == nil && len(b) > 0 {
+	durableGeneration := loadDurableOverlayGeneration()
+	if canonicalGeneration := api.loadCanonicalSidecarGeneration(); canonicalGeneration > durableGeneration {
+		durableGeneration = canonicalGeneration
+	}
+	api.overlayGeneration = durableGeneration
+	if api.mgr != nil && durableGeneration > 0 {
+		api.mgr.SetOverlayGeneration(durableGeneration)
+	}
+
+	overlayMeta, overlayStateErr := loadOverlayState()
+	overlayStatePresent := overlayStateErr == nil
+	overlayTombstoned := false
+	if overlayStateErr != nil && !errors.Is(overlayStateErr, os.ErrNotExist) {
+		// A damaged commit marker must not cause a reopened proxy to fall back
+		// to an unvalidated runtime body. The canonical file layer can still
+		// provide legitimate persistent rules below/outside this constructor.
+		logPolicyEvent("policy.restore", map[string]any{"source": "overlay-generation", "error": overlayStateErr.Error()})
+		overlayMeta = overlayState{Generation: durableGeneration, OverlayGeneration: durableGeneration, Active: false}
+		overlayStatePresent = true
+		_ = os.Remove(runtimeCedarPath())
+	}
+
+	// Attempt to restore runtime Cedar on startup. A current tombstone wins
+	// over a stale Cedar body so a deleted permit-all overlay cannot be
+	// resurrected by a proxy/process reopen.
+	if overlayStatePresent && !overlayMeta.Active {
+		overlayTombstoned = true
+		api.mode = "enforce"
+		_ = os.Remove(runtimeCedarPath())
+		if api.mgr != nil {
+			api.mgr.SetOverlayIdentity(policy.OverlayInfo{
+				Generation:  overlayMeta.Generation,
+				Active:      false,
+				RuntimeOnly: false,
+				Source:      overlayMeta.Source,
+			})
+		}
+		logPolicyEvent("policy.restore", map[string]any{"source": "overlay-tombstone", "generation": overlayMeta.Generation})
+	} else if b, err := loadCedarRuntime(); err == nil && len(b) > 0 {
 		if comp, compErr := cedarutil.CompileString("cedar-runtime.cedar", string(b)); compErr == nil {
 			if hasAnyRules(comp.Policies, comp.HTTPRules) {
-				if err := api.mgr.SetRuntimeRules(comp.Policies, comp.HTTPRules); err != nil {
+				generation := durableGeneration
+				if overlayStatePresent && overlayMeta.Generation > 0 {
+					generation = overlayMeta.Generation
+				}
+				if generation <= 0 {
+					// Legacy persistent files predate generation markers.
+					generation = legacyOverlayGenerationV1
+				}
+				runtimeOnly := overlayStatePresent && overlayMeta.RuntimeOnly
+				mode := "enforce"
+				if overlayStatePresent && strings.TrimSpace(overlayMeta.Mode) != "" {
+					mode = overlayMeta.Mode
+				} else if runtimeOnly {
+					mode = "permit-all"
+				}
+				info := policy.OverlayInfo{
+					Generation:  generation,
+					Active:      true,
+					RuntimeOnly: runtimeOnly || strings.EqualFold(mode, "permit-all"),
+					Source:      "runtime-restore",
+					Token:       canonicalOverlayDigest(string(b)),
+				}
+				if err := api.mgr.RestoreRuntimeRules(comp.Policies, comp.HTTPRules, info); err != nil {
 					if !softLSMError(err) {
 						logPolicyEvent("policy.restore", map[string]any{"source": "runtime", "error": err.Error()})
 					}
 				} else {
 					api.mu.Lock()
 					api.cedarRuntime = string(b)
+					api.overlayGeneration = generation
+					api.mode = mode
 					api.mu.Unlock()
-					logPolicyEvent("policy.restore", map[string]any{"source": "runtime"})
+					logPolicyEvent("policy.restore", map[string]any{"source": "runtime", "generation": generation})
 				}
 			}
 		} else if detail, ok := compErr.(*cedarutil.ErrorDetail); ok {
@@ -126,7 +188,7 @@ func newPolicyAPI(mgr *policy.Manager, policyPath string, broadcaster policyBroa
 	}
 
 	// If nothing was restored and no canonical Cedar exists, seed runtime with the default baseline.
-	if strings.TrimSpace(api.cedarRuntime) == "" && !canonicalHasCedar {
+	if strings.TrimSpace(api.cedarRuntime) == "" && !canonicalHasCedar && !overlayTombstoned {
 		if comp, err := cedarutil.CompileString("default.cedar", policy.DefaultCedar()); err == nil && hasAnyRules(comp.Policies, comp.HTTPRules) {
 			if err := api.mgr.SetRuntimeRules(comp.Policies, comp.HTTPRules); err != nil {
 				if !softLSMError(err) {
@@ -135,14 +197,19 @@ func newPolicyAPI(mgr *policy.Manager, policyPath string, broadcaster policyBroa
 			} else {
 				api.mu.Lock()
 				api.cedarRuntime = policy.DefaultCedar()
+				api.mode = "enforce"
 				api.mu.Unlock()
 				_ = saveCedarRuntime([]byte(api.cedarRuntime))
+				if _, err := api.commitRuntimeOverlay(true, false, "enforce", "baseline", api.cedarRuntime); err != nil {
+					logPolicyEvent("policy.restore", map[string]any{"source": "overlay-generation", "error": err.Error()})
+				}
 				logPolicyEvent("policy.restore", map[string]any{"source": "baseline"})
 			}
 		} else if detail, ok := err.(*cedarutil.ErrorDetail); ok {
 			logPolicyEvent("policy.restore", map[string]any{"source": "baseline", "error": detail.Message})
 		}
 	}
+	api.publishProxyOverlayGeneration()
 	return api
 }
 
@@ -153,6 +220,8 @@ func (api *policyAPI) register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/policies/complete", api.handlePoliciesComplete)
 	mux.HandleFunc("/api/policies/permit-all", api.handlePermitAll)
 	mux.HandleFunc("/api/policies/enforce-apply", api.handleEnforceApply)
+	mux.HandleFunc("/api/policies/overlay", api.handleOverlay)
+	mux.HandleFunc("/api/policies/runtime-overlay", api.handleOverlay)
 	mux.HandleFunc("/api/policies/lines", api.handlePolicyLines)
 	mux.HandleFunc("/api/policies/add", api.handleAddPolicy)
 	mux.HandleFunc("/api/policies/add-from-action", api.handleAddPolicyFromAction)
@@ -252,6 +321,11 @@ func (api *policyAPI) handlePost(w http.ResponseWriter, r *http.Request) {
 	api.mu.Lock()
 	api.cedarRuntime = cedar
 	api.mu.Unlock()
+	mode := api.enforcementModeValue()
+	if _, err := api.commitRuntimeOverlay(true, strings.EqualFold(mode, "permit-all"), mode, "post", cedar); err != nil {
+		logPolicyEvent("policy.update", map[string]any{"error": err.Error(), "persist": "overlay-generation"})
+	}
+	api.publishProxyOverlayGeneration()
 
 	resp := api.buildPoliciesResponse()
 	api.respondPolicies(w, resp)
@@ -275,6 +349,13 @@ type patchPolicyRemove struct {
 }
 
 func (api *policyAPI) respondPolicies(w http.ResponseWriter, resp map[string]any) {
+	if generation, ok := resp["overlayGeneration"].(int64); ok && generation > 0 {
+		value := strconv.FormatInt(generation, 10)
+		w.Header().Set("X-Overlay-Generation", value)
+		w.Header().Set("X-Policy-Generation", value)
+		w.Header().Set("X-Generation", value)
+		w.Header().Set("ETag", `"`+value+`"`)
+	}
 	writeJSON(w, http.StatusOK, resp)
 	api.broadcastPolicySnapshot(resp)
 }
@@ -285,6 +366,14 @@ func (api *policyAPI) broadcastPolicySnapshot(resp map[string]any) {
 	}
 
 	payload := map[string]any{"policies": resp}
+	for _, key := range []string{
+		"generation", "currentGeneration", "overlayGeneration", "overlay_generation",
+		"runtimeGeneration", "overlayActive", "hasOverlay", "enforcementMode",
+	} {
+		if value, ok := resp[key]; ok {
+			payload[key] = value
+		}
+	}
 	if lines, err := renderPolicyLines(api.currentCedarSnapshot()); err == nil {
 		payload["lines"] = lines
 	} else {
@@ -316,8 +405,9 @@ func (api *policyAPI) handlePatch(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "applyMode must be \"enforce\" or omitted"})
 		return
 	}
-	permitAllMode := strings.EqualFold(api.mode, "permit-all")
-	if applyMode == "" && !permitAllMode && strings.EqualFold(api.mode, "enforce") {
+	currentMode := api.enforcementModeValue()
+	permitAllMode := strings.EqualFold(currentMode, "permit-all")
+	if applyMode == "" && !permitAllMode && strings.EqualFold(currentMode, "enforce") {
 		applyMode = "enforce"
 	}
 
@@ -522,6 +612,13 @@ func (api *policyAPI) handlePatch(w http.ResponseWriter, r *http.Request) {
 	}
 	api.cedarRuntime = updated
 	api.mu.Unlock()
+	if applyMode != "enforce" && !permitAllMode {
+		mode := api.enforcementModeValue()
+		if _, err := api.commitRuntimeOverlay(true, false, mode, "patch", updated); err != nil {
+			logPolicyEvent("policy.patch", map[string]any{"error": err.Error(), "persist": "overlay-generation"})
+		}
+		api.publishProxyOverlayGeneration()
+	}
 
 	prevFile, prevHTTP, _, _ := api.mgr.Snapshot()
 	if err := api.mgr.UpdateFileRules(compilation.Policies, compilation.HTTPRules); err != nil {
@@ -553,11 +650,15 @@ func (api *policyAPI) handlePatch(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		api.mode = "enforce"
 		api.mu.Lock()
 		api.cedarPrev = ""
 		api.cedarRuntime = updated
+		api.mode = "enforce"
 		api.mu.Unlock()
+		if _, err := api.commitOverlayTombstone("enforce", "patch-enforce"); err != nil {
+			logPolicyEvent("policy.patch", map[string]any{"error": err.Error(), "persist": "overlay-generation"})
+		}
+		api.publishProxyOverlayGeneration()
 	}
 
 	logPolicyEvent("policy.patch", map[string]any{
@@ -669,7 +770,7 @@ func (api *policyAPI) handlePersistPolicies(w http.ResponseWriter, r *http.Reque
 	}
 
 	// If currently enforcing, clear runtime overlays so file layer is authoritative.
-	if api.mode == "enforce" {
+	if api.enforcementModeValue() == "enforce" {
 		_ = api.mgr.SetRuntimeRules(&lsm.PolicySet{}, nil)
 	}
 
@@ -1011,8 +1112,64 @@ func (api *policyAPI) handlePermitAll(w http.ResponseWriter, r *http.Request) {
 		// to enforce mode.
 		api.cedarPrev = api.cedarRuntime
 	}
-	api.mu.Unlock()
 	api.mode = "permit-all"
+	api.mu.Unlock()
+
+	// Permit-all is runtime-only, but its generation is durable so a reopened
+	// proxy can distinguish this live overlay from an older deleted body.
+	if err := saveCedarRuntime([]byte(cedarAllowAll)); err != nil {
+		logPolicyEvent("policy.permit_all", map[string]any{"error": err.Error(), "persist": "cedar-runtime"})
+	}
+	if _, err := api.commitRuntimeOverlay(true, true, "permit-all", "permit-all", cedarAllowAll); err != nil {
+		logPolicyEvent("policy.permit_all", map[string]any{"error": err.Error(), "persist": "overlay-generation"})
+	}
+	api.publishProxyOverlayGeneration()
+	resp := api.buildPoliciesResponse()
+	api.respondPolicies(w, resp)
+}
+
+// handleOverlay deletes the runtime overlay generation. It is the explicit
+// public lifecycle endpoint for callers that do not want to promote a policy
+// through the canonical-file enforce flow.
+func (api *policyAPI) handleOverlay(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodDelete && r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	generation, err := api.mgr.ClearRuntimeOverlay()
+	if err != nil && !softLSMError(err) {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+
+	fileCedar := ""
+	if cf, loadErr := api.loadCanonicalCedar(); loadErr == nil {
+		fileCedar = string(cf)
+	}
+	api.mu.Lock()
+	api.mode = "enforce"
+	api.cedarPrev = ""
+	if strings.TrimSpace(fileCedar) != "" {
+		api.cedarRuntime = fileCedar
+	} else {
+		api.cedarRuntime = ""
+	}
+	api.overlayGeneration = generation
+	api.mu.Unlock()
+
+	if persistedGeneration, commitErr := api.commitOverlayTombstone("enforce", "overlay-delete"); commitErr != nil {
+		logPolicyEvent("policy.overlay.delete", map[string]any{"error": commitErr.Error(), "generation": generation})
+	} else {
+		generation = persistedGeneration
+	}
+	api.publishProxyOverlayGeneration()
+
 	resp := api.buildPoliciesResponse()
 	api.respondPolicies(w, resp)
 }
@@ -1077,9 +1234,16 @@ func (api *policyAPI) handleEnforceApply(w http.ResponseWriter, r *http.Request)
 		api.cedarRuntime = fileCedar
 	}
 	api.cedarPrev = ""
+	api.mode = "enforce"
 	api.mu.Unlock()
 
-	api.mode = "enforce"
+	// The runtime overlay has been deleted. Publish a durable tombstone and
+	// remove cedar-runtime.cedar so reopening the proxy cannot restore the
+	// old permit-all generation.
+	if generation, err := api.commitOverlayTombstone("enforce", "enforce-apply"); err != nil {
+		logPolicyEvent("policy.enforce_apply", map[string]any{"error": err.Error(), "generation": generation})
+	}
+	api.publishProxyOverlayGeneration()
 	resp := api.buildPoliciesResponse()
 	api.respondPolicies(w, resp)
 }
@@ -1092,15 +1256,19 @@ func (api *policyAPI) buildPoliciesResponse() map[string]any {
 	api.mu.RUnlock()
 	// Best-effort read of persisted Cedar file for UI
 	cf, _ := api.loadCanonicalCedar()
-	return map[string]any{
+	resp := map[string]any{
 		"active":          newPolicyLayerView(activeLSM, activeHTTP),
 		"file":            newPolicyLayerView(fileLSM, fileHTTP),
 		"runtime":         newPolicyLayerView(runtimeLSM, runtimeHTTP),
 		"cedarRuntime":    cr,
 		"cedarFile":       string(cf),
 		"cedarBaseline":   policy.DefaultCedar(),
-		"enforcementMode": api.mode,
+		"enforcementMode": api.enforcementModeValue(),
 	}
+	for key, value := range overlayResponseFields(api) {
+		resp[key] = value
+	}
+	return resp
 }
 
 // softLSMError returns true when an LSM/bpf update error should not fail the request.
@@ -1280,6 +1448,7 @@ func setCORS(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
+	w.Header().Set("Access-Control-Expose-Headers", "ETag, X-Overlay-Generation, X-Policy-Generation, X-Generation")
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -1296,11 +1465,11 @@ func getLeashDirFromEnv() string {
 }
 
 func saveCedarRuntime(b []byte) error {
-	dir := getLeashDirFromEnv()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	path := runtimeCedarPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, "cedar-runtime-*.tmp")
+	tmp, err := os.CreateTemp(filepath.Dir(path), "cedar-runtime-*.tmp")
 	if err != nil {
 		return err
 	}
@@ -1319,7 +1488,7 @@ func saveCedarRuntime(b []byte) error {
 		os.Remove(tmpPath)
 		return err
 	}
-	return os.Rename(tmpPath, filepath.Join(dir, "cedar-runtime.cedar"))
+	return os.Rename(tmpPath, path)
 }
 
 func (api *policyAPI) saveCanonicalCedar(b []byte) error {
@@ -1354,8 +1523,7 @@ func (api *policyAPI) saveCanonicalCedar(b []byte) error {
 }
 
 func loadCedarRuntime() ([]byte, error) {
-	dir := getLeashDirFromEnv()
-	return os.ReadFile(filepath.Join(dir, "cedar-runtime.cedar"))
+	return os.ReadFile(runtimeCedarPath())
 }
 
 func (api *policyAPI) loadCanonicalCedar() ([]byte, error) {
@@ -1907,6 +2075,10 @@ func (api *policyAPI) addPolicyStatement(newCedar string) (map[string]any, int, 
 	api.mu.Lock()
 	api.cedarRuntime = updated
 	api.mu.Unlock()
+	if _, err := api.commitRuntimeOverlay(true, false, api.enforcementModeValue(), "add", updated); err != nil {
+		logPolicyEvent("policy.add", map[string]any{"error": err.Error(), "persist": "overlay-generation"})
+	}
+	api.publishProxyOverlayGeneration()
 
 	logPolicyEvent("policy.add", map[string]any{"id": newPolicy.ID})
 
@@ -2229,6 +2401,10 @@ func (api *policyAPI) deletePolicy(req deletePolicyRequest) (map[string]any, int
 	api.mu.Lock()
 	api.cedarRuntime = updated
 	api.mu.Unlock()
+	if _, err := api.commitRuntimeOverlay(true, false, api.enforcementModeValue(), "delete", updated); err != nil {
+		logPolicyEvent("policy.delete", map[string]any{"error": err.Error(), "persist": "overlay-generation"})
+	}
+	api.publishProxyOverlayGeneration()
 
 	prevFile, prevHTTP, _, _ := api.mgr.Snapshot()
 	if err := api.mgr.UpdateFileRules(lsmRules, httpRules); err != nil {

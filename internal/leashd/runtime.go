@@ -397,9 +397,14 @@ func initRuntime(cfg *runtimeConfig, leashDir string) (*runtimeState, error) {
 		telemetryProvider: telemetryProvider,
 	}
 
-	policyManager := policy.NewManager(lsmManager, func(rules *lsm.PolicySet, httpRules []proxy.HeaderRewriteRule) {
+	var policyManager *policy.Manager
+	policyManager = policy.NewManager(lsmManager, func(rules *lsm.PolicySet, httpRules []proxy.HeaderRewriteRule) {
 		state.headerRewriter.SetRules(httpRules)
-		applyPolicyToProxy(state.mitmProxy, rules)
+		generation := policyManager.OverlayGeneration()
+		connectRules := lsm.ConvertToConnectRules(rules.Connect)
+		defaultAllow := connectDefaultAllow(rules)
+		checker := lsm.NewSimplePolicyChecker(connectRules, defaultAllow, rules.MCP).SetGeneration(generation)
+		state.mitmProxy.SetPolicyCheckerGeneration(checker, generation)
 	})
 
 	if err := policyManager.UpdateFileRules(initialPolicy.LSMPolicies, initialPolicy.HTTPRewrites); err != nil {

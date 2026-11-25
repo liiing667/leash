@@ -522,6 +522,7 @@ type SimplePolicyChecker struct {
 	rules         []ConnectPolicyRule
 	defaultPolicy bool // true = allow, false = deny
 	mcpRules      []MCPPolicyRule
+	generation    int64
 }
 
 // NewSimplePolicyChecker creates a new policy checker with the given rules
@@ -532,6 +533,26 @@ func NewSimplePolicyChecker(rules []ConnectPolicyRule, defaultPolicy bool, mcpRu
 		mcpRules:      normalizeMCPRules(mcpRules),
 	}
 }
+
+// SetGeneration binds this checker to a policy/overlay generation.
+func (pc *SimplePolicyChecker) SetGeneration(generation int64) *SimplePolicyChecker {
+	pc.generation = generation
+	return pc
+}
+
+// WithGeneration returns the checker after binding its generation.
+func (pc *SimplePolicyChecker) WithGeneration(generation int64) *SimplePolicyChecker {
+	return pc.SetGeneration(generation)
+}
+
+// PolicyGeneration implements proxy.PolicyGenerationProvider.
+func (pc *SimplePolicyChecker) PolicyGeneration() int64 { return pc.generation }
+
+// OverlayGeneration is an alias for runtime overlay consumers.
+func (pc *SimplePolicyChecker) OverlayGeneration() int64 { return pc.generation }
+
+// Generation is the short alias for generation-aware consumers.
+func (pc *SimplePolicyChecker) Generation() int64 { return pc.generation }
 
 // CheckConnect implements the PolicyChecker interface for MITMProxy
 func (pc *SimplePolicyChecker) CheckConnect(hostname string, ip string, port uint16) bool {
