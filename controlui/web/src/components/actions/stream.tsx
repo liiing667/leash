@@ -542,8 +542,10 @@ export function ActionsStream({ instanceId, onPolicyMutated }: { instanceId?: st
       const isMcpCall = action.type === "mcp/call";
       const isDeny = effect === "forbid";
       if (isMcpCall) {
-        if (!tool || !server) {
-          // Surface a friendly message and abort rather than creating a server-only rule for tool calls
+        if (!tool) {
+          // A tools/call policy needs a tool identity. When the server is also
+          // known the statement is scoped per source; otherwise the backend
+          // persists a tool-only rule instead of inventing a placeholder host.
           const verb = isDeny ? "deny" : "allow";
           try { showNotice?.(`Select a tools/call event with a specific tool name to ${verb}.`); } catch {}
           setPendingId(null);

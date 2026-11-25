@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -20,7 +22,16 @@ const (
 	defaultSSEEventLimit = 10
 	maxObservedServers   = 32
 	maxObservedTools     = 32
+	maxObservedPairs     = 128
 )
+
+// MCPToolObservation ties a tool call to the server (source identity) it was
+// observed on. Tracking the pair avoids collapsing tools that share a name but
+// are served by different MCP servers into a single ambiguous hint.
+type MCPToolObservation struct {
+	Server string
+	Tool   string
+}
 
 // MCPMode controls whether MCP observability is active and which attributes are logged.
 type MCPMode int
@@ -52,6 +63,9 @@ type mcpObserver struct {
 	observedMu    sync.RWMutex
 	recentServers []string
 	recentTools   []string
+	// recentPairs preserves the (server, tool) association, including multiple
+	// observations of the same tool name from different source servers.
+	recentPairs []MCPToolObservation
 }
 
 type mcpRequestContext struct {
@@ -121,6 +135,21 @@ func (o *mcpObserver) SnapshotTools() []string {
 	return out
 }
 
+// SnapshotToolObservations returns the most recently observed (server, tool)
+// pairs. Each entry preserves the source server the tool was invoked on, so
+// callers can persist per-source policy suggestions instead of cross-pairing
+// tools and servers from unrelated observations.
+func (o *mcpObserver) SnapshotToolObservations() []MCPToolObservation {
+	if o == nil {
+		return nil
+	}
+	o.observedMu.RLock()
+	defer o.observedMu.RUnlock()
+	out := make([]MCPToolObservation, len(o.recentPairs))
+	copy(out, o.recentPairs)
+	return out
+}
+
 func (o *mcpObserver) setForceParse(enabled bool) {
 	if o == nil {
 		return
@@ -180,7 +209,7 @@ func (o *mcpObserver) inspectHTTPRequest(req *http.Request, server string) (*mcp
 		o.rememberServer(ctx.server)
 	}
 	if ctx.tool != "" {
-		o.rememberTool(ctx.tool)
+		o.rememberToolOnServer(ctx.tool, ctx.server)
 	}
 
 	if disabled {
@@ -309,7 +338,7 @@ func (o *mcpObserver) logHTTPRequest(ctx *mcpRequestContext, status int, outcome
 	}
 
 	if ctx.tool != "" {
-		o.rememberTool(ctx.tool)
+		o.rememberToolOnServer(ctx.tool, ctx.server)
 	}
 
 	if ctx.id != "" && o.cfg.Mode != MCPModeOff {
@@ -695,7 +724,11 @@ func (o *mcpObserver) rememberServer(server string) {
 	o.recentServers = rememberValue(o.recentServers, server, maxObservedServers)
 }
 
-func (o *mcpObserver) rememberTool(tool string) {
+// rememberToolOnServer records a tool call against the server it was observed
+// on. The flat tool list is retained for backward-compatible hints, while the
+// paired list keeps each source identity distinct so a tool name shared by
+// multiple servers produces one observation per (server, tool) combination.
+func (o *mcpObserver) rememberToolOnServer(tool, server string) {
 	if o == nil {
 		return
 	}
@@ -703,9 +736,63 @@ func (o *mcpObserver) rememberTool(tool string) {
 	if tool == "" {
 		return
 	}
+	server = normalizeMCPServerIdentity(server)
 	o.observedMu.Lock()
 	defer o.observedMu.Unlock()
 	o.recentTools = rememberValue(o.recentTools, tool, maxObservedTools)
+	o.recentPairs = rememberPair(o.recentPairs, MCPToolObservation{Server: server, Tool: tool}, maxObservedPairs)
+}
+
+// rememberPair moves an existing matching pair to the front (most-recent-first)
+// or inserts a fresh pair, bounding the slice. Matching is case-insensitive and
+// keeps an empty server as a distinct, tool-only source identity.
+func rememberPair(existing []MCPToolObservation, pair MCPToolObservation, limit int) []MCPToolObservation {
+	tool := strings.ToLower(strings.TrimSpace(pair.Tool))
+	server := strings.ToLower(strings.TrimSpace(pair.Server))
+	if tool == "" {
+		return existing
+	}
+	out := make([]MCPToolObservation, 0, len(existing)+1)
+	out = append(out, MCPToolObservation{Server: pair.Server, Tool: pair.Tool})
+	for _, p := range existing {
+		if strings.EqualFold(strings.TrimSpace(p.Tool), tool) &&
+			strings.EqualFold(strings.TrimSpace(p.Server), server) {
+			continue
+		}
+		out = append(out, p)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+// normalizeMCPServerIdentity reduces an observed server reference to a stable
+// source identity: lowercase host with any scheme and port stripped, mirroring
+// the normalization applied when MCP policy rules are enforced.
+func normalizeMCPServerIdentity(server string) string {
+	s := strings.TrimSpace(server)
+	if s == "" {
+		return ""
+	}
+	s = strings.ToLower(s)
+	if strings.Contains(s, "://") {
+		if u, err := url.Parse(s); err == nil {
+			if host := u.Hostname(); host != "" {
+				s = host
+			}
+		}
+	}
+	if strings.Contains(s, "/") {
+		s = strings.SplitN(s, "/", 2)[0]
+	}
+	if host, _, err := net.SplitHostPort(s); err == nil && host != "" {
+		s = host
+	}
+	return strings.TrimSpace(s)
 }
 
 func rememberValue(existing []string, value string, limit int) []string {
@@ -846,7 +933,7 @@ func (o *mcpObserver) logStreamRequest(ctx *mcpRequestContext, env *parsedEnvelo
 	}
 
 	if env.ToolName != "" {
-		o.rememberTool(env.ToolName)
+		o.rememberToolOnServer(env.ToolName, ctx.server)
 	}
 
 	if env.ID != "" {

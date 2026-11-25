@@ -284,6 +284,22 @@ forbid (
 
 The proxy will allow other tools on `mcp.context7.com` but deny calls to `resolve-library-id`.
 
+### Policy Shapes and Source Identity
+
+Suggestions generated from observed MCP traffic are persisted separately for
+each `(server, tool)` source identity, so a tool name served by two different
+MCP servers (for example `search` on both `alpha.example.com` and
+`beta.example.com`) produces two distinct statements rather than one mixed
+policy. Three shapes are supported:
+
+- **Server + tool (per-source)**: the scoped form shown above; full URL server
+  references are normalized to host-only `MCP::Server` entities.
+- **Host-only**: `resource in [ MCP::Server::"registry.corp" ]` with no tool
+  constraint, matching every tool on that server.
+- **Tool-only**: `resource == MCP::Tool::"resolve-library-id"` with no server
+  constraint, used when the source server could not be observed; it matches the
+  tool name on any server.
+
 ### Informational Permit (V1)
 
 In v1, `permit` on `McpCall` is recorded but not enforced:

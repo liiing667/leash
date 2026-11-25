@@ -151,6 +151,18 @@ func (p *MITMProxy) SnapshotMCPHints() (servers []string, tools []string) {
 	return p.mcpObserver.SnapshotServers(), p.mcpObserver.SnapshotTools()
 }
 
+// SnapshotMCPToolObservations returns observed MCP tool calls paired with the
+// server (source identity) each tool was invoked on. Unlike SnapshotMCPHints,
+// which returns flat server and tool lists, this preserves the (server, tool)
+// association so policy suggestions can be persisted per source instead of
+// mixing a tool name across unrelated servers.
+func (p *MITMProxy) SnapshotMCPToolObservations() []MCPToolObservation {
+	if p == nil || p.mcpObserver == nil {
+		return nil
+	}
+	return p.mcpObserver.SnapshotToolObservations()
+}
+
 // getOriginalDest gets the original destination using SO_ORIGINAL_DST
 func getOriginalDest(conn net.Conn) (string, error) {
 	tcpConn, ok := conn.(*net.TCPConn)

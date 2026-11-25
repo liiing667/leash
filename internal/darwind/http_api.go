@@ -22,6 +22,7 @@ import (
 	cedarutil "github.com/strongdm/leash/internal/cedar"
 	autocomplete "github.com/strongdm/leash/internal/cedar/autocomplete"
 	"github.com/strongdm/leash/internal/lsm"
+	"github.com/strongdm/leash/internal/mcpsuggest"
 	"github.com/strongdm/leash/internal/policy"
 	"github.com/strongdm/leash/internal/proxy"
 	"github.com/strongdm/leash/internal/transpiler"
@@ -158,6 +159,7 @@ func (api *policyAPI) register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/policies/lines", api.handlePolicyLines)
 	mux.HandleFunc("/api/policies/add", api.handleAddPolicy)
 	mux.HandleFunc("/api/policies/add-from-action", api.handleAddPolicyFromAction)
+	mux.HandleFunc("/api/policies/mcp-suggestions", api.handleMCPSuggestions)
 	mux.HandleFunc("/api/policies/delete", api.handleDeletePolicy)
 }
 
@@ -1771,7 +1773,9 @@ func buildCedarFromActionRequest(req addPolicyFromActionRequest) (string, error)
 		return buildHeadEqualityPolicy(effect, `Action::"NetworkConnect"`, resource), nil
 		// MCP events: Option A — Action::"McpCall" with MCP::Tool and MCP::Server
 	case "mcp/deny", "mcp/allow", "mcp/list", "mcp/call", "mcp/resources", "mcp/prompts", "mcp/init", "mcp/notify":
-		// Prefer structured fields when provided
+		// Prefer structured fields when provided. The server and tool are kept
+		// paired through mcpsuggest so a tool name observed on multiple servers
+		// produces per-source statements instead of one cross-paired policy.
 		server := strings.TrimSpace(req.Action.Server)
 		tool := strings.TrimSpace(req.Action.Tool)
 		if server == "" {
@@ -1780,13 +1784,12 @@ func buildCedarFromActionRequest(req addPolicyFromActionRequest) (string, error)
 		if tool == "" {
 			tool = parseToolFromName(name)
 		}
-		if server == "" {
+		// Tool-only observations retain a tool-only statement; only fall back to
+		// the placeholder host when neither identity is available.
+		if server == "" && tool == "" {
 			server = "example.com"
 		}
-		if tool != "" {
-			return fmt.Sprintf(`%s (principal, action == Action::"McpCall", resource == MCP::Tool::"%s") when { resource in [ MCP::Server::"%s" ] };`, effect, escapeCedarString(tool), escapeCedarString(server)), nil
-		}
-		return fmt.Sprintf(`%s (principal, action == Action::"McpCall", resource) when { resource in [ MCP::Server::"%s" ] };`, effect, escapeCedarString(server)), nil
+		return mcpsuggest.BuildStatement(effect, server, tool)
 	default:
 		return "", fmt.Errorf("unsupported action type %q", actType)
 	}
