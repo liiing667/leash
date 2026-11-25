@@ -39,6 +39,8 @@ type policyAPI struct {
 	cedarRuntime string
 	cedarPrev    string
 	mu           sync.RWMutex
+	commitMu     sync.Mutex
+	generation   int64
 
 	// policyPath is the canonical Cedar file persisted for the file layer.
 	policyPath string
@@ -91,6 +93,7 @@ func newPolicyAPI(mgr *policy.Manager, policyPath string, broadcaster policyBroa
 		broadcaster: broadcaster,
 		mitmProxy:   mitmProxy,
 		wsHub:       wsHub,
+		generation:  loadPolicyGeneration(policyPath),
 	}
 	if api.wsHub == nil {
 		if h, ok := broadcaster.(*websockethub.WebSocketHub); ok {
@@ -173,6 +176,10 @@ func (api *policyAPI) handlePolicies(w http.ResponseWriter, r *http.Request) {
 		api.handlePost(w, r)
 	case http.MethodPatch:
 		api.handlePatch(w, r)
+	case http.MethodPut:
+		// PUT is the full-snapshot optimistic update alias for clients that
+		// model compare-and-swap policy writes as idempotent replacement.
+		api.handlePost(w, r)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -185,6 +192,26 @@ func (api *policyAPI) handleGet(w http.ResponseWriter, r *http.Request) {
 
 func (api *policyAPI) handlePost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MiB
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "invalid request body"}})
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+
+	api.commitMu.Lock()
+	defer api.commitMu.Unlock()
+	precondition, err := parseGenerationPrecondition(r, body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": err.Error()}})
+		return
+	}
+	if !precondition.matches(api.currentPolicyGeneration(), api.currentCedarSnapshot()) {
+		api.writeGenerationConflict(w, r)
+		return
+	}
+	beforeVersionToken := policyGenerationToken(api.editableCedar())
+
 	cedar, err := extractCedar(r)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": err.Error()}})
@@ -253,6 +280,10 @@ func (api *policyAPI) handlePost(w http.ResponseWriter, r *http.Request) {
 	api.cedarRuntime = cedar
 	api.mu.Unlock()
 
+	if policyGenerationToken(cedar) != beforeVersionToken {
+		api.advancePolicyGeneration()
+	}
+
 	resp := api.buildPoliciesResponse()
 	api.respondPolicies(w, resp)
 }
@@ -275,6 +306,13 @@ type patchPolicyRemove struct {
 }
 
 func (api *policyAPI) respondPolicies(w http.ResponseWriter, resp map[string]any) {
+	if generation, ok := resp["generation"].(int64); ok {
+		if etag, ok := resp["etag"].(string); ok && etag != "" {
+			w.Header().Set("ETag", etag)
+		}
+		w.Header().Set("X-Policy-Generation", strconv.FormatInt(generation, 10))
+		w.Header().Set("X-Generation", strconv.FormatInt(generation, 10))
+	}
 	writeJSON(w, http.StatusOK, resp)
 	api.broadcastPolicySnapshot(resp)
 }
@@ -298,11 +336,35 @@ func (api *policyAPI) handlePatch(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	defer r.Body.Close()
 
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request body"})
+		return
+	}
+
 	var payload patchPoliciesRequest
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	if err := json.Unmarshal(body, &payload); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON payload"})
 		return
 	}
+
+	// Serialize the compare-and-commit boundary. The generation check and the
+	// eventual generation advance must not be separated by another patch.
+	api.commitMu.Lock()
+	defer api.commitMu.Unlock()
+
+	precondition, err := parseGenerationPrecondition(r, body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	currentGeneration := api.currentPolicyGeneration()
+	currentVersionCedar := api.currentCedarSnapshot()
+	if !precondition.matches(currentGeneration, currentVersionCedar) {
+		api.writeGenerationConflict(w, r)
+		return
+	}
+	beforeVersionToken := policyGenerationToken(api.editableCedar())
 
 	addCount := len(payload.Add)
 	removeCount := len(payload.Remove)
@@ -316,8 +378,9 @@ func (api *policyAPI) handlePatch(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "applyMode must be \"enforce\" or omitted"})
 		return
 	}
-	permitAllMode := strings.EqualFold(api.mode, "permit-all")
-	if applyMode == "" && !permitAllMode && strings.EqualFold(api.mode, "enforce") {
+	currentMode := api.enforcementModeValue()
+	permitAllMode := strings.EqualFold(currentMode, "permit-all")
+	if applyMode == "" && !permitAllMode && strings.EqualFold(currentMode, "enforce") {
 		applyMode = "enforce"
 	}
 
@@ -553,8 +616,8 @@ func (api *policyAPI) handlePatch(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		api.mode = "enforce"
 		api.mu.Lock()
+		api.mode = "enforce"
 		api.cedarPrev = ""
 		api.cedarRuntime = updated
 		api.mu.Unlock()
@@ -565,6 +628,13 @@ func (api *policyAPI) handlePatch(w http.ResponseWriter, r *http.Request) {
 		"remove":    removeCount,
 		"applyMode": applyMode,
 	})
+
+	// A semantically unchanged patch is an idempotent no-op and therefore keeps
+	// the generation that the client read. Real changes publish one new
+	// generation only after every in-memory and durable commit has succeeded.
+	if policyGenerationToken(updated) != beforeVersionToken {
+		api.advancePolicyGeneration()
+	}
 
 	resp := api.buildPoliciesResponse()
 	api.respondPolicies(w, resp)
@@ -585,6 +655,26 @@ func (api *policyAPI) handlePersistPolicies(w http.ResponseWriter, r *http.Reque
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request body"})
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+
+	api.commitMu.Lock()
+	defer api.commitMu.Unlock()
+	precondition, err := parseGenerationPrecondition(r, body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if !precondition.matches(api.currentPolicyGeneration(), api.currentCedarSnapshot()) {
+		api.writeGenerationConflict(w, r)
+		return
+	}
+	beforeVersionToken := policyGenerationToken(api.editableCedar())
+
 	cedar, err := extractCedar(r)
 	if err != nil {
 		if strings.EqualFold(err.Error(), "empty body") {
@@ -669,7 +759,7 @@ func (api *policyAPI) handlePersistPolicies(w http.ResponseWriter, r *http.Reque
 	}
 
 	// If currently enforcing, clear runtime overlays so file layer is authoritative.
-	if api.mode == "enforce" {
+	if api.enforcementModeValue() == "enforce" {
 		_ = api.mgr.SetRuntimeRules(&lsm.PolicySet{}, nil)
 	}
 
@@ -678,6 +768,10 @@ func (api *policyAPI) handlePersistPolicies(w http.ResponseWriter, r *http.Reque
 		_ = api.mgr.UpdateFileRules(prevFile, prevHTTP)
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": fmt.Sprintf("failed to persist Cedar: %v", err)})
 		return
+	}
+
+	if policyGenerationToken(cedar) != beforeVersionToken {
+		api.advancePolicyGeneration()
 	}
 
 	resp := api.buildPoliciesResponse()
@@ -1011,8 +1105,8 @@ func (api *policyAPI) handlePermitAll(w http.ResponseWriter, r *http.Request) {
 		// to enforce mode.
 		api.cedarPrev = api.cedarRuntime
 	}
-	api.mu.Unlock()
 	api.mode = "permit-all"
+	api.mu.Unlock()
 	resp := api.buildPoliciesResponse()
 	api.respondPolicies(w, resp)
 }
@@ -1077,9 +1171,9 @@ func (api *policyAPI) handleEnforceApply(w http.ResponseWriter, r *http.Request)
 		api.cedarRuntime = fileCedar
 	}
 	api.cedarPrev = ""
+	api.mode = "enforce"
 	api.mu.Unlock()
 
-	api.mode = "enforce"
 	resp := api.buildPoliciesResponse()
 	api.respondPolicies(w, resp)
 }
@@ -1089,17 +1183,35 @@ func (api *policyAPI) buildPoliciesResponse() map[string]any {
 	activeLSM, activeHTTP := api.mgr.GetActiveRules()
 	api.mu.RLock()
 	cr := api.cedarRuntime
+	generation := api.generation
+	mode := api.mode
 	api.mu.RUnlock()
 	// Best-effort read of persisted Cedar file for UI
 	cf, _ := api.loadCanonicalCedar()
+	versionCedar := api.currentCedarSnapshot()
+	etag := generationETag(generation)
+	contentEtag := policyETag(versionCedar)
 	return map[string]any{
-		"active":          newPolicyLayerView(activeLSM, activeHTTP),
-		"file":            newPolicyLayerView(fileLSM, fileHTTP),
-		"runtime":         newPolicyLayerView(runtimeLSM, runtimeHTTP),
-		"cedarRuntime":    cr,
-		"cedarFile":       string(cf),
-		"cedarBaseline":   policy.DefaultCedar(),
-		"enforcementMode": api.mode,
+		"active":              newPolicyLayerView(activeLSM, activeHTTP),
+		"file":                newPolicyLayerView(fileLSM, fileHTTP),
+		"runtime":             newPolicyLayerView(runtimeLSM, runtimeHTTP),
+		"cedarRuntime":        cr,
+		"cedarFile":           string(cf),
+		"cedarBaseline":       policy.DefaultCedar(),
+		"enforcementMode":     mode,
+		"generation":          generation,
+		"currentGeneration":   generation,
+		"current_generation":  generation,
+		"committedGeneration": generation,
+		"newGeneration":       generation,
+		"nextGeneration":      generation,
+		"policyGeneration":    generation,
+		"policy_generation":   generation,
+		"version":             generation,
+		"revision":            generation,
+		"etag":                etag,
+		"contentEtag":         contentEtag,
+		"generationToken":     strings.Trim(contentEtag, `"`),
 	}
 }
 
@@ -1279,7 +1391,8 @@ func extractCedar(r *http.Request) (string, error) {
 func setCORS(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Expose-Headers", "ETag, X-Policy-Generation, X-Generation")
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -1910,6 +2023,7 @@ func (api *policyAPI) addPolicyStatement(newCedar string) (map[string]any, int, 
 
 	logPolicyEvent("policy.add", map[string]any{"id": newPolicy.ID})
 
+	api.advancePolicyGeneration()
 	resp := api.buildPoliciesResponse()
 	return resp, http.StatusOK, nil
 }
@@ -2254,6 +2368,7 @@ func (api *policyAPI) deletePolicy(req deletePolicyRequest) (map[string]any, int
 		"description": deletedLine.Humanized,
 	})
 
+	api.advancePolicyGeneration()
 	resp := api.buildPoliciesResponse()
 	return resp, http.StatusOK, nil
 }
@@ -2484,6 +2599,25 @@ func (api *policyAPI) handleAddPolicy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request body"})
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+
+	api.commitMu.Lock()
+	defer api.commitMu.Unlock()
+	precondition, err := parseGenerationPrecondition(r, body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if !precondition.matches(api.currentPolicyGeneration(), api.currentCedarSnapshot()) {
+		api.writeGenerationConflict(w, r)
+		return
+	}
+
 	newCedar, err := extractCedar(r)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -2514,9 +2648,26 @@ func (api *policyAPI) handleAddPolicyFromAction(w http.ResponseWriter, r *http.R
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	defer r.Body.Close()
 
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request body"})
+		return
+	}
 	var req addPolicyFromActionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON payload"})
+		return
+	}
+
+	api.commitMu.Lock()
+	defer api.commitMu.Unlock()
+	precondition, err := parseGenerationPrecondition(r, body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if !precondition.matches(api.currentPolicyGeneration(), api.currentCedarSnapshot()) {
+		api.writeGenerationConflict(w, r)
 		return
 	}
 
@@ -2550,9 +2701,26 @@ func (api *policyAPI) handleDeletePolicy(w http.ResponseWriter, r *http.Request)
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	defer r.Body.Close()
 
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request body"})
+		return
+	}
 	var req deletePolicyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON payload"})
+		return
+	}
+
+	api.commitMu.Lock()
+	defer api.commitMu.Unlock()
+	precondition, err := parseGenerationPrecondition(r, body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if !precondition.matches(api.currentPolicyGeneration(), api.currentCedarSnapshot()) {
+		api.writeGenerationConflict(w, r)
 		return
 	}
 
