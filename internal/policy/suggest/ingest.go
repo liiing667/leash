@@ -20,11 +20,22 @@ func BuildSequencesFromLogs(logs []websocket.LogEntry, window time.Duration) []p
 	// Defensive copy + sort by time
 	items := make([]websocket.LogEntry, 0, len(logs))
 	items = append(items, logs...)
-	sort.Slice(items, func(i, j int) bool {
+	sort.SliceStable(items, func(i, j int) bool {
 		ti := parseTime(items[i].Time)
 		tj := parseTime(items[j].Time)
 		if ti.Equal(tj) {
-			// stable-ish fallback
+			// Log batches frequently share timestamps. Use the producer's
+			// monotonic sequence when available, then semantic fields, so that
+			// serializing the same objects in a different order does not change
+			// the mined sequence or its suggestion identity.
+			if items[i].Seq != 0 && items[j].Seq != 0 && items[i].Seq != items[j].Seq {
+				return items[i].Seq < items[j].Seq
+			}
+			ki := logOrderIdentity(items[i])
+			kj := logOrderIdentity(items[j])
+			if ki != kj {
+				return ki < kj
+			}
 			return i < j
 		}
 		return ti.Before(tj)
@@ -64,13 +75,52 @@ func BuildSequencesFromLogs(logs []websocket.LogEntry, window time.Duration) []p
 		cur.seq.Events = append(cur.seq.Events, toPatternEvent(e, ts))
 	}
 
-	// Drain any active cursors
-	for _, cur := range byPrincipal {
+	// Drain any active cursors in principal order so map iteration cannot leak
+	// into the public snapshot order.
+	principals := make([]string, 0, len(byPrincipal))
+	for principal := range byPrincipal {
+		principals = append(principals, principal)
+	}
+	sort.Strings(principals)
+	for _, principal := range principals {
+		cur := byPrincipal[principal]
 		if len(cur.seq.Events) > 0 {
 			out = append(out, cur.seq)
 		}
 	}
 	return out
+}
+
+func logOrderIdentity(e websocket.LogEntry) string {
+	parts := []string{
+		strings.TrimSpace(e.Time),
+		strings.TrimSpace(e.Event),
+		strings.TrimSpace(e.Tool),
+		strings.TrimSpace(e.Exe),
+		strings.TrimSpace(e.Path),
+		strings.TrimSpace(e.Args),
+		strings.TrimSpace(e.Addr),
+		strings.TrimSpace(e.AddrIP),
+		strings.TrimSpace(e.Port),
+		strings.TrimSpace(e.Server),
+		strings.TrimSpace(e.Hostname),
+		strings.TrimSpace(e.HostnameResolved),
+		strings.TrimSpace(e.HostnameObserved),
+		strings.TrimSpace(e.Domain),
+		strings.TrimSpace(e.Decision),
+		strings.TrimSpace(e.Protocol),
+		strings.TrimSpace(e.Method),
+		strings.TrimSpace(e.Rule),
+		strings.TrimSpace(e.Header),
+		strings.TrimSpace(e.OldValue),
+		strings.TrimSpace(e.NewValue),
+		strings.TrimSpace(e.Error),
+		strings.TrimSpace(e.Reason),
+		strings.TrimSpace(e.Family),
+		strings.TrimSpace(e.Auth),
+		strings.TrimSpace(e.InstanceID),
+	}
+	return strings.Join(parts, "\x00")
 }
 
 func parseTime(raw string) time.Time {

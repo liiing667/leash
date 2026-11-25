@@ -1,7 +1,9 @@
 package transpiler
 
 import (
+	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/strongdm/leash/internal/lsm"
 	"github.com/strongdm/leash/internal/proxy"
@@ -33,7 +35,69 @@ func cloneAndSortPolicyRules(policies *lsm.PolicySet) (openRules, execRules, con
 		return connectRules[i].HostnameLen > connectRules[j].HostnameLen
 	})
 
+	// Grouping or ingesting the same source through different object orders can
+	// produce identical rule entries. They describe one policy, so publishing
+	// both would only duplicate Cedar statements and confuse persistence.
+	openRules = dedupePolicyRules(openRules)
+	execRules = dedupePolicyRules(execRules)
+	connectRules = dedupePolicyRules(connectRules)
+
 	return
+}
+
+func dedupePolicyRules(rules []lsm.PolicyRule) []lsm.PolicyRule {
+	seen := make(map[string]struct{}, len(rules))
+	out := make([]lsm.PolicyRule, 0, len(rules))
+	for _, rule := range rules {
+		key := policyRuleIdentity(rule)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, rule)
+	}
+	return out
+}
+
+func policyRuleIdentity(rule lsm.PolicyRule) string {
+	var args []string
+	for i := int32(0); i < rule.ArgCount && i < int32(len(rule.Args)); i++ {
+		length := rule.ArgLens[i]
+		if length < 0 {
+			length = 0
+		}
+		if length > int32(len(rule.Args[i])) {
+			length = int32(len(rule.Args[i]))
+		}
+		args = append(args, string(rule.Args[i][:length]))
+	}
+	pathLen := rule.PathLen
+	if pathLen < 0 {
+		pathLen = 0
+	}
+	if pathLen > int32(len(rule.Path)) {
+		pathLen = int32(len(rule.Path))
+	}
+	hostnameLen := rule.HostnameLen
+	if hostnameLen < 0 {
+		hostnameLen = 0
+	}
+	if hostnameLen > int32(len(rule.Hostname)) {
+		hostnameLen = int32(len(rule.Hostname))
+	}
+	return fmt.Sprintf("%d|%d|%s|%d|%d|%d|%d|%d|%s|%d|%s",
+		rule.Action,
+		rule.Operation,
+		string(rule.Path[:pathLen]),
+		rule.IsDirectory,
+		rule.ArgCount,
+		rule.HasWildcard,
+		rule.DestIP,
+		rule.DestPort,
+		string(rule.Hostname[:hostnameLen]),
+		rule.IsWildcard,
+		strings.Join(args, "\x00"),
+	)
 }
 
 func PolicySetToLines(policies *lsm.PolicySet, httpRules []proxy.HeaderRewriteRule) []string {

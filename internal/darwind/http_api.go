@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ import (
 	autocomplete "github.com/strongdm/leash/internal/cedar/autocomplete"
 	"github.com/strongdm/leash/internal/lsm"
 	"github.com/strongdm/leash/internal/policy"
+	"github.com/strongdm/leash/internal/policy/suggest"
 	"github.com/strongdm/leash/internal/proxy"
 	"github.com/strongdm/leash/internal/transpiler"
 	websockethub "github.com/strongdm/leash/internal/websocket"
@@ -101,7 +103,15 @@ func newPolicyAPI(mgr *policy.Manager, policyPath string, broadcaster policyBroa
 	}
 	// Attempt to restore runtime Cedar on startup
 	if b, err := loadCedarRuntime(); err == nil && len(b) > 0 {
-		if comp, compErr := cedarutil.CompileString("cedar-runtime.cedar", string(b)); compErr == nil {
+		restoredCedar := dedupeCedarText(string(b))
+		comp, compErr := cedarutil.CompileString("cedar-runtime.cedar", restoredCedar)
+		if compErr != nil {
+			// Preserve compatibility when statement extraction cannot represent
+			// the persisted source; the original bytes remain authoritative.
+			restoredCedar = string(b)
+			comp, compErr = cedarutil.CompileString("cedar-runtime.cedar", restoredCedar)
+		}
+		if compErr == nil {
 			if hasAnyRules(comp.Policies, comp.HTTPRules) {
 				if err := api.mgr.SetRuntimeRules(comp.Policies, comp.HTTPRules); err != nil {
 					if !softLSMError(err) {
@@ -109,7 +119,7 @@ func newPolicyAPI(mgr *policy.Manager, policyPath string, broadcaster policyBroa
 					}
 				} else {
 					api.mu.Lock()
-					api.cedarRuntime = string(b)
+					api.cedarRuntime = restoredCedar
 					api.mu.Unlock()
 					logPolicyEvent("policy.restore", map[string]any{"source": "runtime"})
 				}
@@ -336,7 +346,8 @@ func (api *policyAPI) handlePatch(w http.ResponseWriter, r *http.Request) {
 		}
 		index := -1
 		for i, stmt := range currentStatements {
-			if strings.TrimSpace(stmt) == target {
+			if strings.TrimSpace(stmt) == target ||
+				suggest.CanonicalCedarIdentity(stmt) == suggest.CanonicalCedarIdentity(target) {
 				index = i
 				break
 			}
@@ -347,7 +358,8 @@ func (api *policyAPI) handlePatch(w http.ResponseWriter, r *http.Request) {
 		}
 		currentStatements = append(currentStatements[:index], currentStatements[index+1:]...)
 		for id, stmt := range idToStatement {
-			if stmt == target {
+			if stmt == target ||
+				suggest.CanonicalCedarIdentity(stmt) == suggest.CanonicalCedarIdentity(target) {
 				delete(idToStatement, id)
 			}
 		}
@@ -383,19 +395,41 @@ func (api *policyAPI) handlePatch(w http.ResponseWriter, r *http.Request) {
 		newStatements = append(newStatements, cedar)
 	}
 
+	existingParser := transpiler.NewCedarParser()
+	var existingSet *transpiler.CedarPolicySet
+	if es, e := existingParser.ParseFromString(strings.Join(currentStatements, "\n\n")); e == nil {
+		existingSet = es
+	}
+
 	for i := len(newStatements) - 1; i >= 0; i-- {
 		stmt := newStatements[i]
 		duplicate := false
 		for _, existingStmt := range currentStatements {
-			if strings.TrimSpace(existingStmt) == strings.TrimSpace(stmt) {
+			if strings.TrimSpace(existingStmt) == strings.TrimSpace(stmt) ||
+				suggest.CanonicalCedarIdentity(existingStmt) == suggest.CanonicalCedarIdentity(stmt) {
 				duplicate = true
 				break
+			}
+		}
+		if !duplicate && existingSet != nil {
+			if newSet, err := existingParser.ParseFromString(stmt); err == nil && newSet != nil && len(newSet.Policies) > 0 {
+				for _, ep := range existingSet.Policies {
+					if policiesAreEquivalent(newSet.Policies[0], ep) {
+						duplicate = true
+						break
+					}
+				}
 			}
 		}
 		if duplicate {
 			continue
 		}
 		currentStatements = append([]string{stmt}, currentStatements...)
+		if existingSet != nil {
+			if more, err := existingParser.ParseFromString(stmt); err == nil && more != nil {
+				existingSet.Policies = append(existingSet.Policies, more.Policies...)
+			}
+		}
 	}
 
 	if len(currentStatements) > 0 {
@@ -1370,13 +1404,22 @@ func dedupeCedarStatements(statements []string) []string {
 		if trimmed == "" {
 			continue
 		}
-		if _, ok := seen[trimmed]; ok {
+		identity := suggest.CanonicalCedarIdentity(trimmed)
+		if identity == "" {
+			identity = trimmed
+		}
+		if _, ok := seen[identity]; ok {
 			continue
 		}
-		seen[trimmed] = struct{}{}
+		seen[identity] = struct{}{}
 		deduped = append(deduped, trimmed)
 	}
 	return deduped
+}
+
+func dedupeCedarText(cedar string) string {
+	statements := dedupeCedarStatements(extractCedarStatements(cedar))
+	return strings.TrimSpace(strings.Join(statements, "\n\n"))
 }
 
 type policyLine struct {
@@ -1679,6 +1722,10 @@ func (api *policyAPI) addPolicyStatement(newCedar string) (map[string]any, int, 
 	if existing != "" {
 		updated = stmt + "\n\n" + existing
 	}
+	// Last-resort canonical idempotency keeps reordered object sets from being
+	// persisted twice. The semantic equivalence check above normally returns
+	// before this point and leaves an operator-authored statement untouched.
+	updated = dedupeCedarText(updated)
 
 	tr := transpiler.NewCedarToLeashTranspiler()
 	lsmRules, httpRules, err := tr.TranspileFromString(updated)
@@ -1982,7 +2029,8 @@ func (api *policyAPI) deletePolicy(req deletePolicyRequest) (map[string]any, int
 			deletedLine = line
 			break
 		}
-		if targetCedar != "" && strings.TrimSpace(line.Cedar) == targetCedar {
+		if targetCedar != "" && (strings.TrimSpace(line.Cedar) == targetCedar ||
+			suggest.CanonicalCedarIdentity(line.Cedar) == suggest.CanonicalCedarIdentity(targetCedar)) {
 			index = idx
 			deletedLine = line
 			break
@@ -1997,7 +2045,7 @@ func (api *policyAPI) deletePolicy(req deletePolicyRequest) (map[string]any, int
 	}
 
 	statements = append(statements[:index], statements[index+1:]...)
-	updated := strings.TrimSpace(strings.Join(statements, "\n\n"))
+	updated := dedupeCedarText(strings.Join(statements, "\n\n"))
 
 	tr := transpiler.NewCedarToLeashTranspiler()
 	lsmRules, httpRules, err := tr.TranspileFromString(updated)
@@ -2360,12 +2408,19 @@ func policiesAreEquivalent(p1, p2 transpiler.CedarPolicy) bool {
 		return false
 	}
 
-	// For conditions, we'll use the native AST comparison if available
+	// Conditions are a conjunction, so their extracted representation can be
+	// compared independently of clause order.
+	if !conditionsEqual(p1.Conditions, p2.Conditions) {
+		return false
+	}
+
+	// Native policies give a stronger check that also covers constructs the
+	// lightweight IR may not retain. Canonical Cedar makes unordered sets and
+	// statement formatting irrelevant.
 	if p1.NativePolicy != nil && p2.NativePolicy != nil {
-		// Compare using AST string representation as a proxy
-		ast1 := fmt.Sprintf("%+v", p1.NativePolicy.AST())
-		ast2 := fmt.Sprintf("%+v", p2.NativePolicy.AST())
-		if ast1 != ast2 {
+		cedar1 := suggest.CanonicalCedarIdentity(string(p1.NativePolicy.MarshalCedar()))
+		cedar2 := suggest.CanonicalCedarIdentity(string(p2.NativePolicy.MarshalCedar()))
+		if cedar1 != "" && cedar2 != "" && cedar1 != cedar2 {
 			return false
 		}
 	}
@@ -2374,41 +2429,91 @@ func policiesAreEquivalent(p1, p2 transpiler.CedarPolicy) bool {
 }
 
 func entityConstraintsEqual(e1, e2 transpiler.EntityConstraint) bool {
-	if e1.IsAny != e2.IsAny || e1.Type != e2.Type || e1.ID != e2.ID {
+	if e1.IsAny != e2.IsAny || e1.Type != e2.Type || e1.ID != e2.ID || e1.IsLike != e2.IsLike {
 		return false
 	}
-	if len(e1.InSet) != len(e2.InSet) {
-		return false
-	}
-	// For simplicity, require exact match of InSet
-	for i := range e1.InSet {
-		if e1.InSet[i] != e2.InSet[i] {
-			return false
-		}
-	}
-	return true
+	return sameStringSet(e1.InSet, e2.InSet)
 }
 
 func actionConstraintsEqual(a1, a2 transpiler.ActionConstraint) bool {
 	if a1.IsAny != a2.IsAny {
 		return false
 	}
-	if len(a1.Actions) != len(a2.Actions) {
+	return sameStringSet(a1.Actions, a2.Actions) && sameStringSet(a1.InSet, a2.InSet)
+}
+
+func conditionsEqual(a, b []transpiler.Condition) bool {
+	if len(a) != len(b) {
 		return false
 	}
-	// Compare action lists (order matters for our purposes)
-	for i := range a1.Actions {
-		if a1.Actions[i] != a2.Actions[i] {
-			return false
-		}
+	keysA := make([]string, 0, len(a))
+	keysB := make([]string, 0, len(b))
+	for _, condition := range a {
+		keysA = append(keysA, canonicalConditionIdentity(condition))
 	}
-	if len(a1.InSet) != len(a2.InSet) {
-		return false
+	for _, condition := range b {
+		keysB = append(keysB, canonicalConditionIdentity(condition))
 	}
-	for i := range a1.InSet {
-		if a1.InSet[i] != a2.InSet[i] {
+	sort.Strings(keysA)
+	sort.Strings(keysB)
+	for i := range keysA {
+		if keysA[i] != keysB[i] {
 			return false
 		}
 	}
 	return true
+}
+
+func canonicalConditionIdentity(condition transpiler.Condition) string {
+	return strings.Join([]string{
+		strconv.Itoa(int(condition.Type)),
+		condition.Kind,
+		normalizePolicyText(condition.Expression),
+		condition.ContextKey,
+		fmt.Sprintf("%#v", condition.ContextValue),
+		condition.Pattern,
+		condition.Operator,
+		strings.Join(uniqueSortedStrings(condition.ResourceSet), "\x1f"),
+		fmt.Sprintf("%#v", condition.Variables),
+		fmt.Sprintf("%#v", condition.Operands),
+	}, "\x00")
+}
+
+func sameStringSet(a, b []string) bool {
+	setA := make(map[string]struct{}, len(a))
+	for _, item := range a {
+		setA[strings.TrimSpace(item)] = struct{}{}
+	}
+	setB := make(map[string]struct{}, len(b))
+	for _, item := range b {
+		setB[strings.TrimSpace(item)] = struct{}{}
+	}
+	if len(setA) != len(setB) {
+		return false
+	}
+	for item := range setA {
+		if _, ok := setB[item]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func uniqueSortedStrings(items []string) []string {
+	seen := make(map[string]struct{}, len(items))
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func normalizePolicyText(value string) string {
+	return strings.Join(strings.Fields(value), " ")
 }

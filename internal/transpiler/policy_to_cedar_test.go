@@ -1,6 +1,7 @@
 package transpiler
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/strongdm/leash/internal/lsm"
@@ -60,5 +61,20 @@ forbid(
 
 	if cedar != expected {
 		t.Fatalf("unexpected cedar output:\nwant:\n%s\ngot:\n%s", expected, cedar)
+	}
+}
+
+func TestPolicySetToCedarDeduplicatesEquivalentRules(t *testing.T) {
+	t.Parallel()
+
+	rule := lsm.PolicyRule{Action: lsm.PolicyAllow, Operation: lsm.OpOpen}
+	path := "/etc/passwd"
+	copy(rule.Path[:], path)
+	rule.PathLen = int32(len(path))
+
+	policies := &lsm.PolicySet{Open: []lsm.PolicyRule{rule, rule}}
+	cedar := PolicySetToCedar(policies)
+	if got := strings.Count(cedar, "FileOpen"); got != 1 {
+		t.Fatalf("expected one deduplicated rule, got %d:\n%s", got, cedar)
 	}
 }

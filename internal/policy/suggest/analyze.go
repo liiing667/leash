@@ -81,9 +81,19 @@ func Analyze(inputs Inputs, opts Options) Result {
 		suggestions = append(suggestions, workflowSuggestions(inputs.EventSequences, opts)...)
 	}
 
+	// The same policy can be observed by different passes or serialized with a
+	// different object order. Collapse those semantic duplicates before the
+	// public result is published, retaining every producer's evidence.
+	suggestions = Deduplicate(suggestions)
+
 	sort.SliceStable(suggestions, func(i, j int) bool {
 		if suggestions[i].Kind == suggestions[j].Kind {
-			return suggestions[i].PolicyCount > suggestions[j].PolicyCount
+			if suggestions[i].PolicyCount != suggestions[j].PolicyCount {
+				return suggestions[i].PolicyCount > suggestions[j].PolicyCount
+			}
+			// Map-backed passes can enumerate equal-count buckets in random
+			// order. Use semantic identity as the final deterministic tie-break.
+			return SemanticIdentity(suggestions[i]) < SemanticIdentity(suggestions[j])
 		}
 		return suggestions[i].Kind < suggestions[j].Kind
 	})
@@ -436,6 +446,12 @@ func workflowSuggestions(seqs []pattern.Sequence, opts Options) []Suggestion {
 	if len(filtered) == 0 {
 		return nil
 	}
+	// Clustering assigns cluster IDs in encounter order. Sort sequences by their
+	// stable session identity so two snapshots containing the same sessions in a
+	// different object order produce the same suggestion identities.
+	sort.SliceStable(filtered, func(i, j int) bool {
+		return filtered[i].SessionID < filtered[j].SessionID
+	})
 
 	clusters := encoding.AffinityCluster(filtered, encoding.BagOfNGrams, opts.ClusterSimilarity)
 	if len(clusters) == 0 {
